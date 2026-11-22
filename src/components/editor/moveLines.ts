@@ -56,13 +56,56 @@ function planMove(lines: Line[], from: number, to: number, direction: Direction)
   return { low, high, order, from: shiftFrom, to: shiftTo };
 }
 
+// Swap complete sibling items so checkboxes, marks, and nested lists travel together.
+function moveListItems(view: EditorView, selection: TextSelection, direction: Direction) {
+  const { $from, $to } = selection;
+  const itemDepth = $from.depth - 1;
+  if (itemDepth < 1 || $from.parent.type.name !== "paragraph" ||
+      $to.parent.type.name !== "paragraph" || $to.depth !== $from.depth) return false;
+  const itemType = $from.node(itemDepth).type.name;
+  const listDepth = itemDepth - 1;
+  if ((itemType !== "listItem" && itemType !== "taskItem") ||
+      $from.start(listDepth) !== $to.start(listDepth)) return false;
+
+  const list = $from.node(listDepth);
+  const first = $from.index(listDepth);
+  const endsAtNextItem = first < $to.index(listDepth) && $to.pos === $to.before(itemDepth) + 2;
+  const last = $to.index(listDepth) - Number(endsAtNextItem);
+  const neighborIndex = direction < 0 ? first - 1 : last + 1;
+  const neighbor = list.maybeChild(neighborIndex);
+  if (!neighbor) return true;
+
+  const start = $from.before(itemDepth);
+  const end = endsAtNextItem ? $to.before(itemDepth) : $to.after(itemDepth);
+  const { state } = view;
+  const items = state.doc.slice(start, end).content;
+  const tr = closeHistory(state.tr);
+  if (direction < 0) {
+    tr.replaceWith(start - neighbor.nodeSize, end, items.addToEnd(neighbor));
+  } else {
+    tr.replaceWith(start, end + neighbor.nodeSize, items.addToStart(neighbor));
+  }
+
+  const delta = direction * neighbor.nodeSize;
+  const movedFrom = selection.from + delta;
+  // An exclusive end at the next item's start may now be at the end of the list.
+  const movedTo = endsAtNextItem && last + direction === list.childCount - 1
+    ? TextSelection.near(tr.doc.resolve(end + delta), -1).head
+    : selection.to + delta;
+  const reversed = selection.anchor > selection.head;
+  tr.setSelection(TextSelection.create(tr.doc, reversed ? movedTo : movedFrom, reversed ? movedFrom : movedTo));
+  view.dispatch(tr.scrollIntoView());
+  return true;
+}
+
 export function moveEditorLines(view: EditorView, direction: Direction) {
   const { state } = view;
   const { selection } = state;
   if (!(selection instanceof TextSelection)) return false;
   const { $from, $to } = selection;
   if (!$from.parent.isTextblock || !$to.parent.isTextblock ||
-      $from.depth !== $to.depth || $from.node(-1) !== $to.node(-1)) return false;
+      $from.depth !== $to.depth) return false;
+  if ($from.start(-1) !== $to.start(-1)) return moveListItems(view, selection, direction);
 
   let lines = textblockLines($from.parent, $from.start());
   if ($from.parent.type.name === "paragraph") {
@@ -81,7 +124,10 @@ export function moveEditorLines(view: EditorView, direction: Direction) {
   } else if (!$from.sameParent($to)) return false;
 
   const move = planMove(lines, selection.from, selection.to, direction);
-  if (!move) return true;
+  if (!move) {
+    moveListItems(view, selection, direction);
+    return true;
+  }
   const tr = closeHistory(state.tr);
   // Keep each separator in place and move the inline content, including its marks.
   for (let i = move.high; i >= move.low; i--) {

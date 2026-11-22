@@ -3698,6 +3698,12 @@ fn enable_webview_spellcheck_defaults() {
     ];
 
     let defaults = NSUserDefaults::standardUserDefaults();
+    // Otherwise WKWebView inherits Smart Dashes from NSSpellChecker and
+    // rewrites Markdown delimiters and Mermaid edges as the user types.
+    let dash_key = NSString::from_str("WebAutomaticDashSubstitutionEnabled");
+    if defaults.objectForKey(&dash_key).is_none() {
+        defaults.setBool_forKey(false, &dash_key);
+    }
     for key in keys {
         let key = NSString::from_str(key);
         if defaults.objectForKey(&key).is_none() {

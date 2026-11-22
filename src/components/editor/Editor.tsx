@@ -2475,6 +2475,8 @@ export function Editor({
                   lineHeight: "var(--editor-line-height)",
                   tabSize: 2,
                 }}
+                autoCorrect="off"
+                autoCapitalize="off"
                 spellCheck={false}
               />
             </div>

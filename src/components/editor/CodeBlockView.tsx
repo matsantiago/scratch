@@ -132,7 +132,7 @@ export function CodeBlockView({ node, updateAttributes, editor, getPos }: ReactN
             opacity: 0,
           }}
         >
-          <pre>
+          <pre autoCorrect="off" autoCapitalize="off" spellCheck={false}>
             {/* @ts-expect-error - "code" is a valid intrinsic element for NodeViewContent */}
             <NodeViewContent as="code" />
           </pre>
@@ -144,7 +144,7 @@ export function CodeBlockView({ node, updateAttributes, editor, getPos }: ReactN
   return (
     <NodeViewWrapper className="code-block-wrapper" as="div">
       {toolbar}
-      <pre>
+      <pre autoCorrect="off" autoCapitalize="off" spellCheck={false}>
         {/* @ts-expect-error - "code" is a valid intrinsic element for NodeViewContent */}
         <NodeViewContent as="code" />
       </pre>
