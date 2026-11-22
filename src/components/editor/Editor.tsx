@@ -1,3 +1,5 @@
+import { moveEditorLines, moveLineDirection, moveSourceLines } from "./moveLines";
+import { MermaidLiveLayout } from "./MermaidLivePanel";
 import {
   useEffect,
   useLayoutEffect,
@@ -1158,14 +1160,9 @@ export function Editor({
           return fallback;
         }
       },
-      // Trap Tab key inside the editor
-      handleKeyDown: (_view, event) => {
-        if (event.key === "Tab") {
-          // Allow default tab behavior (indent in lists, etc.)
-          // but prevent focus from leaving the editor
-          return false;
-        }
-        return false;
+      handleKeyDown: (view, event) => {
+        const direction = moveLineDirection(event);
+        return direction ? moveEditorLines(view, direction) : false;
       },
       // Handle markdown and image paste
       handlePaste: (_view, event) => {
@@ -2444,7 +2441,7 @@ export function Editor({
         />
       </div>
 
-      {/* Editor content area with resize handles overlay */}
+      <MermaidLiveLayout documentId={currentNote.id} sourceMode={sourceMode}>
       <div data-editor-content-area className="flex-1 relative overflow-hidden">
         {!focusMode && !sourceMode && (
           <EditorWidthHandles containerRef={scrollContainerRef} />
@@ -2460,6 +2457,12 @@ export function Editor({
             <div className="h-full">
               <textarea
                 value={sourceContent}
+                onKeyDown={e => {
+                  const direction = moveLineDirection(e.nativeEvent);
+                  if (!direction) return;
+                  e.preventDefault();
+                  moveSourceLines(e.currentTarget, direction);
+                }}
                 onChange={(e) => handleSourceChange(e.target.value)}
                 wrap="off"
                 dir={textDirection}
@@ -2695,6 +2698,7 @@ export function Editor({
           )}
         </div>
       </div>
+      </MermaidLiveLayout>
     </div>
   );
 }

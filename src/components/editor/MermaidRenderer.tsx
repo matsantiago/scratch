@@ -1,11 +1,12 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { renderMermaidSVG } from "beautiful-mermaid";
 
 interface MermaidRendererProps {
   code: string;
+  retainLastValid?: boolean;
 }
 
-export function MermaidRenderer({ code }: MermaidRendererProps) {
+export function MermaidRenderer({ code, retainLastValid = false }: MermaidRendererProps) {
   const { svg, error } = useMemo(() => {
     if (!code.trim()) return { svg: null, error: null };
     try {
@@ -27,26 +28,23 @@ export function MermaidRenderer({ code }: MermaidRendererProps) {
     }
   }, [code]);
 
-  if (error) {
-    return (
-      <div className="text-xs text-text-muted italic px-2 pt-6 pb-3 text-center">
-        Mermaid syntax error
-      </div>
-    );
-  }
-
-  if (!svg) {
-    return (
-      <div className="text-xs text-text-muted italic px-2 pt-6 pb-3 text-center">
-        Empty mermaid diagram
-      </div>
-    );
-  }
+  const lastValid = useRef<string | null>(null);
+  useEffect(() => {
+    if (svg || !code.trim()) lastValid.current = svg;
+  }, [svg, code]);
+  const visibleSvg = svg ?? (error && retainLastValid ? lastValid.current : null);
 
   return (
-    <div
-      className="mermaid-diagram flex justify-center py-2"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <>
+      {(error || !code.trim()) && (
+        <p role="status" className="text-xs text-text-muted italic px-2 pt-4 text-center">
+          {error ? (visibleSvg ? "Syntax error · showing last valid diagram" : "Mermaid syntax error") : "Empty mermaid diagram"}
+        </p>
+      )}
+      {visibleSvg && (
+        <div className="mermaid-diagram flex justify-center py-2"
+          dangerouslySetInnerHTML={{ __html: visibleSvg }} />
+      )}
+    </>
   );
 }

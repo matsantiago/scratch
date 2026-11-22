@@ -1,4 +1,4 @@
-import { mod, shift } from "./platform";
+import { alt, mod, shift } from "./platform";
 
 export interface Shortcut {
   keys: string[];
@@ -41,6 +41,7 @@ export const shortcutCategories: ShortcutCategory[] = [
   {
     title: "Editor",
     shortcuts: [
+      { keys: [alt, "↑ / ↓"], description: "Move line up / down" },
       { keys: [mod, "B"], description: "Bold" },
       { keys: [mod, "I"], description: "Italic" },
       { keys: [mod, "K"], description: "Add / edit link" },

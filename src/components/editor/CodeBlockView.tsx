@@ -1,4 +1,6 @@
-import { useCallback, useState } from "react";
+import { useCallback, useContext, useEffect, useId, useState } from "react";
+import { createPortal } from "react-dom";
+import { MermaidLiveContext } from "./MermaidLivePanel";
 import { NodeViewWrapper, NodeViewContent } from "@tiptap/react";
 import type { ReactNodeViewProps } from "@tiptap/react";
 import { SUPPORTED_LANGUAGES } from "./lowlight";
@@ -9,11 +11,36 @@ import { CodeCopyButton } from "../ui";
 const btnClass =
   "code-block-mermaid-btn inline-flex items-center gap-1 text-xs h-6 px-1.5 text-text-muted rounded cursor-pointer transition-colors hover:text-text hover:bg-bg-emphasis";
 
-export function CodeBlockView({ node, updateAttributes }: ReactNodeViewProps) {
+export function CodeBlockView({ node, updateAttributes, editor, getPos }: ReactNodeViewProps) {
   const language: string = node.attrs.language || "";
   const isMermaid = language === "mermaid";
   const [showSource, setShowSource] = useState(!node.textContent.trim());
   const codeContent = node.textContent;
+
+  const id = useId();
+  const live = useContext(MermaidLiveContext);
+  const setActive = live?.setActive;
+  const isLive = isMermaid && live?.active === id;
+  const panelOpen = Boolean(live?.active);
+
+  useEffect(() => {
+    if (!isMermaid || !setActive) return;
+    return () => setActive(current => current === id ? null : current);
+  }, [id, isMermaid, setActive]);
+
+  useEffect(() => {
+    if (!panelOpen || !isMermaid || !setActive) return;
+    const followCursor = () => {
+      const pos = getPos();
+      const { $from } = editor.state.selection;
+      if (pos !== undefined && $from.depth && $from.before() === pos) {
+        setActive(id);
+        setShowSource(true);
+      }
+    };
+    editor.on("selectionUpdate", followCursor);
+    return () => { editor.off("selectionUpdate", followCursor); };
+  }, [editor, getPos, id, isMermaid, panelOpen, setActive]);
 
   const handleLanguageChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -28,7 +55,10 @@ export function CodeBlockView({ node, updateAttributes }: ReactNodeViewProps) {
       {isMermaid && (
         <button
           contentEditable={false}
-          onClick={() => setShowSource(!showSource)}
+          onClick={() => {
+            if (isLive) setActive?.(null);
+            setShowSource(!showSource);
+          }}
           className={btnClass}
           type="button"
         >
@@ -44,6 +74,26 @@ export function CodeBlockView({ node, updateAttributes }: ReactNodeViewProps) {
             </>
           )}
         </button>
+      )}
+      {isMermaid && live && (
+        <button type="button" className={btnClass} aria-pressed={isLive}
+          onMouseDown={e => e.preventDefault()}
+          onClick={() => {
+            if (!isLive) {
+              setShowSource(true);
+              const pos = getPos();
+              if (pos !== undefined) {
+                const { $from } = editor.state.selection;
+                editor.commands.focus($from.depth && $from.before() === pos ? undefined : pos + 1);
+              }
+            }
+            live.setActive(isLive ? null : id);
+          }}>
+          live-preview
+        </button>
+      )}
+      {isLive && live?.target && createPortal(
+        <MermaidRenderer code={codeContent} retainLastValid />, live.target
       )}
       <div className="relative flex items-center h-6">
         <select

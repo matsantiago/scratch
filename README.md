@@ -8,6 +8,14 @@ A minimalist, offline-first markdown note-taking app for macOS, Windows, and Lin
 
 [Website](https://www.ericli.io/scratch) · [Releases](https://github.com/erictli/scratch/releases)
 
+## Personal macOS fork
+
+In a Mermaid block, click **live-preview** to edit beside a resizable diagram.
+Use **Option+↑** or **Option+↓** to move lines in paragraphs, code blocks, or Markdown source.
+
+On the signing Mac, run `npm ci` and `npm run build:personal` to build the app using
+the existing **Scratch Personal Signing** identity in the login keychain.
+
 ## Features
 
 - **Offline-first** - No cloud, no account, no internet required
