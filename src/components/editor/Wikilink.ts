@@ -3,6 +3,7 @@ import type { NoteMetadata } from "../../types/note";
 
 export interface WikilinkStorage {
   notes: NoteMetadata[];
+  searchTitles?: (query: string) => Promise<NoteMetadata[]>;
 }
 
 export const Wikilink = Node.create<object, WikilinkStorage>({

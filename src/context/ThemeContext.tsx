@@ -79,7 +79,7 @@ export { defaultThemeColors };
 
 // Normalize any CSS color string (hex, rgb(), rgba(), hsl(), named) to an RGB
 // triple by letting the browser parse it via getComputedStyle.
-function parseCssColorToRgb(value: string): [number, number, number] | null {
+export function parseCssColorToRgb(value: string): [number, number, number] | null {
   if (typeof document === "undefined") return null;
   const probe = document.createElement("div");
   probe.style.color = value;

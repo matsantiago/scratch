@@ -6,8 +6,8 @@ import type { EditorView } from "@tiptap/pm/view";
 type Line = { start: number; end: number };
 type Direction = -1 | 1;
 
-export function moveLineDirection(e: KeyboardEvent): Direction | null {
-  if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.isComposing) return null;
+export function lineShortcutDirection(e: KeyboardEvent): Direction | null {
+  if (!e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return null;
   if (e.key === "ArrowUp") return -1;
   return e.key === "ArrowDown" ? 1 : null;
 }
@@ -30,12 +30,19 @@ function textblockLines(node: Node, start: number): Line[] {
   return rows;
 }
 
-function planMove(lines: Line[], from: number, to: number, direction: Direction) {
+function selectedLineRange(lines: Line[], from: number, to: number) {
   const first = lines.findIndex(row => row.start <= from && from <= row.end);
   const endRow = lines.findIndex(row => row.start <= to && to <= row.end);
   if (first < 0 || endRow < 0) return null;
   const endsAtNextLine = endRow > first && to === lines[endRow].start;
   const last = endsAtNextLine ? endRow - 1 : endRow;
+  return { first, last, endsAtNextLine };
+}
+
+function planMove(lines: Line[], from: number, to: number, direction: Direction) {
+  const range = selectedLineRange(lines, from, to);
+  if (!range) return null;
+  const { first, last, endsAtNextLine } = range;
   const low = direction < 0 ? first - 1 : first;
   const high = direction > 0 ? last + 1 : last;
   if (low < 0 || high >= lines.length) return null;
@@ -138,6 +145,105 @@ export function moveEditorLines(view: EditorView, direction: Direction) {
   const reversed = selection.anchor > selection.head;
   tr.setSelection(TextSelection.create(tr.doc, reversed ? move.to : move.from, reversed ? move.from : move.to));
   view.dispatch(tr.scrollIntoView());
+  return true;
+}
+
+export function duplicateCodeBlockLines(view: EditorView, direction: Direction) {
+  const { state } = view;
+  const { selection } = state;
+  if (!(selection instanceof TextSelection)) return false;
+  const { $from, $to } = selection;
+  if ($from.parent.type.name !== "codeBlock" || !$from.sameParent($to)) return false;
+
+  const lines = textblockLines($from.parent, $from.start());
+  const range = selectedLineRange(lines, selection.from, selection.to);
+  if (!range) return false;
+  const start = lines[range.first].start;
+  const end = lines[range.last].end;
+  const text = state.doc.textBetween(start, end);
+  const tr = closeHistory(state.tr);
+  const offset = direction > 0 ? text.length + 1 : 0;
+  if (direction < 0) tr.insertText(text + "\n", start);
+  else tr.insertText("\n" + text, end);
+
+  tr.setSelection(TextSelection.create(tr.doc, selection.anchor + offset, selection.head + offset));
+  view.dispatch(tr.scrollIntoView());
+  return true;
+}
+
+const DEFAULT_TAB_WIDTH = 2;
+
+function codeIndentStyle(text: string) {
+  const indents = [...text.matchAll(/^([ \t]*)[^ \t\r\n]/gm)].map(match => match[1]);
+  const changes = new Map<number, number>();
+  for (let i = 1; i < indents.length; i++) {
+    const previous = indents[i - 1];
+    const current = indents[i];
+    const change = current.length - previous.length;
+    if (change >= 2 && change <= 8 && !previous.includes("\t") && !current.includes("\t")) {
+      changes.set(change, (changes.get(change) ?? 0) + 1);
+    }
+  }
+  let width = DEFAULT_TAB_WIDTH;
+  let strongest = 0;
+  for (const [change, count] of changes) {
+    if (count > strongest) {
+      width = change;
+      strongest = count;
+    }
+  }
+  const useTabs = indents.some(indent => indent.startsWith("\t")) &&
+    indents.every(indent => !indent || indent.startsWith("\t"));
+  return { width, useTabs };
+}
+
+function measureColumns(text: string, width: number) {
+  let column = 0;
+  let offset = 0;
+  let previousStop = 0;
+  for (const char of text) {
+    if (column % width === 0) previousStop = offset;
+    column += char === "\t" ? width - column % width : 1;
+    offset += char.length;
+  }
+  return { column, previousStop };
+}
+
+export function indentCodeBlockLines(view: EditorView, outdent: boolean) {
+  const { state } = view;
+  const { selection } = state;
+  if (!(selection instanceof TextSelection)) return false;
+  const { $from, $to } = selection;
+  if ($from.parent.type.name !== "codeBlock" || !$from.sameParent($to)) return false;
+
+  const lines = textblockLines($from.parent, $from.start());
+  const range = selectedLineRange(lines, selection.from, selection.to);
+  if (!range) return false;
+  const { width, useTabs } = codeIndentStyle($from.parent.textContent);
+  const tr = closeHistory(state.tr);
+  // Edit from bottom to top so the original line offsets remain valid.
+  for (let i = range.last; i >= range.first; i--) {
+    const { start, end } = lines[i];
+    const line = state.doc.textBetween(start, end);
+    const indent = line.match(/^[ \t]*/)?.[0] ?? "";
+    const pos = !outdent && selection.empty ? selection.from : start + indent.length;
+    const { column, previousStop } = measureColumns(line.slice(0, pos - start), width);
+    if (outdent) {
+      if (indent) tr.delete(start + previousStop, pos);
+    } else {
+      tr.insertText(useTabs ? "\t" : " ".repeat(width - column % width), pos);
+    }
+  }
+
+  if (tr.docChanged) {
+    if (!selection.empty) {
+      const from = tr.mapping.map(selection.from, selection.from === lines[range.first].start ? -1 : 1);
+      const to = tr.mapping.map(selection.to);
+      const backwards = selection.anchor > selection.head;
+      tr.setSelection(TextSelection.create(tr.doc, backwards ? to : from, backwards ? from : to));
+    }
+    view.dispatch(tr.scrollIntoView());
+  }
   return true;
 }
 

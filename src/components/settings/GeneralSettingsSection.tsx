@@ -750,19 +750,8 @@ export function GeneralSettingsSection() {
 }
 
 function FoldersToggle() {
-  const [foldersEnabled, setFoldersEnabled] = useState<boolean | null>(null);
+  const { foldersEnabled, setFoldersEnabled } = useNotes();
   const [isUpdating, setIsUpdating] = useState(false);
-
-  useEffect(() => {
-    invoke<Settings>("get_settings")
-      .then((s) => {
-        setFoldersEnabled(s.foldersEnabled === true);
-      })
-      .catch((error) => {
-        console.error("Failed to load folder setting:", error);
-        setFoldersEnabled(false);
-      });
-  }, []);
 
   const handleToggle = async (enabled: boolean) => {
     if (isUpdating) return;
@@ -779,19 +768,6 @@ function FoldersToggle() {
       setIsUpdating(false);
     }
   };
-
-  if (foldersEnabled === null) {
-    return (
-      <div className="flex gap-1 p-1 rounded-[10px] border border-border shrink-0">
-        <Button variant="ghost" size="xs" disabled>
-          Off
-        </Button>
-        <Button variant="ghost" size="xs" disabled>
-          On
-        </Button>
-      </div>
-    );
-  }
 
   return (
     <div className="flex gap-1 p-1 rounded-[10px] border border-border shrink-0">

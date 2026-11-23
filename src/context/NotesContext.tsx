@@ -9,14 +9,30 @@ import {
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { Note, NoteMetadata } from "../types/note";
+import type { FolderListing, Note, NoteMetadata, SaveResult } from "../types/note";
 import * as notesService from "../services/notes";
 import type { SearchResult } from "../services/notes";
+import { collectVisibleEntries, folderParent, loadExpandedFolders, saveExpandedFolders } from "../lib/folderTree";
+
+interface BrowseState {
+  root: string;
+  treeMode: boolean;
+  expanded: Set<string>;
+  listings: Map<string, FolderListing>;
+  requests: Map<string, number>;
+  requestId: number;
+}
+
+const emptyEntries: FolderListing = { folders: [], notes: [] };
 
 // Separate contexts to prevent unnecessary re-renders
 // Data context: changes frequently, only subscribed by components that need the data
 interface NotesDataContextValue {
   notes: NoteMetadata[];
+  foldersEnabled: boolean;
+  knownFolders: string[];
+  loadedFolders: ReadonlySet<string>;
+  expandedFolders: Set<string>;
   selectedNoteId: string | null;
   currentNote: Note | null;
   notesFolder: string | null;
@@ -25,7 +41,6 @@ interface NotesDataContextValue {
   searchQuery: string;
   searchResults: SearchResult[];
   isSearching: boolean;
-  hasExternalChanges: boolean;
   reloadVersion: number;
 }
 
@@ -34,11 +49,16 @@ interface NotesActionsContextValue {
   selectNote: (id: string) => Promise<void>;
   createNote: () => Promise<void>;
   consumePendingNewNote: (id: string) => boolean;
-  saveNote: (content: string, noteId?: string) => Promise<void>;
+  saveNote: (note: Note, content: string) => Promise<SaveResult<Note>>;
+  acceptDiskNote: (note: Note) => void;
   deleteNote: (id: string) => Promise<void>;
   duplicateNote: (id: string) => Promise<void>;
   refreshNotes: () => Promise<void>;
-  reloadCurrentNote: () => Promise<void>;
+  setFoldersEnabled: (enabled: boolean) => void;
+  expandFolder: (path: string) => void;
+  toggleFolder: (path: string) => void;
+  collapseAllFolders: () => void;
+  reloadCurrentNote: () => void;
   setNotesFolder: (path: string) => Promise<void>;
   syncNotesFolder: (path: string) => Promise<void>;
   search: (query: string) => Promise<void>;
@@ -57,7 +77,15 @@ const NotesDataContext = createContext<NotesDataContextValue | null>(null);
 const NotesActionsContext = createContext<NotesActionsContextValue | null>(null);
 
 export function NotesProvider({ children }: { children: ReactNode }) {
-  const [notes, setNotes] = useState<NoteMetadata[]>([]);
+  const [flatNotes, setFlatNotes] = useState<NoteMetadata[]>([]);
+  const [treeEntries, setTreeEntries] = useState<FolderListing>(emptyEntries);
+  const [loadedFolders, setLoadedFolders] = useState<ReadonlySet<string>>(new Set());
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [foldersEnabled, setFoldersEnabledState] = useState(true);
+  const browseRef = useRef<BrowseState | null>(null);
+  const browseRequestRef = useRef(0);
+  const refreshPathsRef = useRef(new Set<string>());
+  const notes = foldersEnabled ? treeEntries.notes : flatNotes;
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [currentNote, setCurrentNote] = useState<Note | null>(null);
   const [notesFolder, setNotesFolderState] = useState<string | null>(null);
@@ -66,8 +94,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
-  const [hasExternalChanges, setHasExternalChanges] = useState(false);
-  // Increments when user manually refreshes, so Editor knows to reload content
+  // A file change or a manual refresh asks the editor to check the current file.
   const [reloadVersion, setReloadVersion] = useState(0);
 
   // Track recently saved note IDs to ignore file-change events from our own saves
@@ -87,26 +114,114 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // Tracks the ID of a newly created note so Editor can focus its title.
   const pendingNewNoteIdRef = useRef<string | null>(null);
 
-  const refreshNotes = useCallback(async () => {
-    if (!notesFolder) return;
-    try {
-      const notesList = await notesService.listNotes();
-      setNotes(notesList);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load notes");
-    }
-  }, [notesFolder]);
+  const showTree = useCallback((scope: BrowseState) => {
+    setExpandedFolders(scope.expanded);
+    const visible = collectVisibleEntries(scope.listings, scope.expanded);
+    setTreeEntries(visible);
+    setLoadedFolders(new Set(scope.listings.keys()));
+  }, []);
 
-  // Debounced refresh - coalesces rapid saves into a single refresh
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimeoutRef.current) {
-      clearTimeout(refreshTimeoutRef.current);
+  const updateExpandedFolders = useCallback((scope: BrowseState, expanded: Set<string>) => {
+    scope.expanded = expanded;
+    saveExpandedFolders(scope.root, expanded);
+    showTree(scope);
+  }, [showTree]);
+
+  const loadFolders = useCallback(async (scope: BrowseState, parents: Iterable<string>) => {
+    const paths = [...parents];
+    if (!paths.length) return;
+    const request = ++scope.requestId;
+    await Promise.all(paths.map(async path => {
+      scope.requests.set(path, request);
+      try {
+        const listing = await notesService.listFolderEntries(path);
+        if (browseRef.current !== scope || scope.requests.get(path) !== request) return;
+        scope.listings.set(path, listing);
+      } catch (error) {
+        if (browseRef.current !== scope || scope.requests.get(path) !== request) return;
+        console.error("Failed to load folder:", error);
+        setError("Failed to load folder");
+        if (!scope.listings.has(path)) scope.listings.set(path, emptyEntries);
+      } finally {
+        if (scope.requests.get(path) === request) scope.requests.delete(path);
+      }
+    }));
+    if (browseRef.current === scope) showTree(scope);
+  }, [showTree]);
+
+  const refreshNotes = useCallback(async (paths?: Iterable<string>) => {
+    const scope = browseRef.current;
+    if (!scope) return;
+    try {
+      if (!scope.treeMode) {
+        const request = ++scope.requestId;
+        const items = await notesService.listNotes();
+        if (browseRef.current === scope && scope.requestId === request) setFlatNotes(items);
+        return;
+      }
+      const openPaths = new Set(["", ...scope.expanded]);
+      const parents = paths ? [...paths].filter(path => openPaths.has(path)) : openPaths;
+      await loadFolders(scope, parents);
+    } catch (error) {
+      if (browseRef.current === scope) setError(error instanceof Error ? error.message : "Failed to load notes");
     }
+  }, [loadFolders]);
+
+  // Changes in a closed branch do not trigger disk reads for that branch.
+  const scheduleRefresh = useCallback((paths: string[]) => {
+    for (const path of paths) refreshPathsRef.current.add(path);
+    if (refreshTimeoutRef.current !== null) return;
     refreshTimeoutRef.current = window.setTimeout(() => {
       refreshTimeoutRef.current = null;
-      refreshNotes();
-    }, 300);
+      const pending = refreshPathsRef.current;
+      refreshPathsRef.current = new Set();
+      void refreshNotes(pending);
+    }, 250);
   }, [refreshNotes]);
+
+  const setFoldersEnabled = useCallback((enabled: boolean) => {
+    const previous = browseRef.current;
+    if (!previous || previous.treeMode === enabled) return;
+    const scope = { ...previous, treeMode: enabled, requests: new Map<string, number>(), requestId: 0 };
+    browseRef.current = scope;
+    setFoldersEnabledState(enabled);
+    void refreshNotes();
+  }, [refreshNotes]);
+
+  const expandFolder = useCallback((path: string, refresh = false) => {
+    const scope = browseRef.current;
+    if (!scope?.treeMode || !path) return;
+    const expanded = new Set(scope.expanded);
+    const missing = new Set<string>();
+    for (let branch = path; branch; branch = folderParent(branch)) {
+      expanded.add(branch);
+      if (!scope.requests.has(branch) && (!scope.listings.has(branch) || (refresh && branch === path))) {
+        missing.add(branch);
+      }
+    }
+    if (expanded.size !== scope.expanded.size) {
+      updateExpandedFolders(scope, expanded);
+    }
+    if (missing.size) void loadFolders(scope, missing);
+  }, [loadFolders, updateExpandedFolders]);
+
+  const toggleFolder = useCallback((path: string) => {
+    const scope = browseRef.current;
+    if (!scope?.treeMode) return;
+    if (!scope.expanded.has(path)) {
+      expandFolder(path, true);
+      return;
+    }
+    const expanded = new Set([...scope.expanded].filter(branch => branch !== path && !branch.startsWith(path + "/")));
+    updateExpandedFolders(scope, expanded);
+  }, [expandFolder, updateExpandedFolders]);
+
+  const collapseAllFolders = useCallback(() => {
+    const scope = browseRef.current;
+    if (scope?.treeMode && scope.expanded.size) {
+      updateExpandedFolders(scope, new Set());
+    }
+  }, [updateExpandedFolders]);
 
   const selectNote = useCallback(async (id: string) => {
     const requestId = ++selectRequestIdRef.current;
@@ -116,16 +231,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
       // Set selected ID immediately for responsive UI
       setSelectedNoteId(id);
-      setHasExternalChanges(false);
-      // Expand parent folders so the note is visible in the tree
-      const lastSlash = id.lastIndexOf("/");
-      if (lastSlash > 0) {
-        window.dispatchEvent(
-          new CustomEvent("expand-folder", {
-            detail: id.substring(0, lastSlash),
-          }),
-        );
-      }
+      expandFolder(folderParent(id));
       const note = await notesService.readNote(id);
       if (requestId !== selectRequestIdRef.current) return;
       setCurrentNote(note);
@@ -133,18 +239,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (requestId !== selectRequestIdRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to load note");
     }
+  }, [expandFolder]);
+
+  const reloadCurrentNote = useCallback(() => {
+    setReloadVersion((v) => v + 1);
   }, []);
 
-  const reloadCurrentNote = useCallback(async () => {
-    if (!selectedNoteIdRef.current) return;
-    try {
-      const note = await notesService.readNote(selectedNoteIdRef.current);
-      setCurrentNote(note);
-      setHasExternalChanges(false);
-      setReloadVersion((v) => v + 1);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to reload note");
-    }
+  const acceptDiskNote = useCallback((note: Note) => {
+    setCurrentNote(previous => previous?.path === note.path ? note : previous);
   }, []);
 
   const createNote = useCallback(async () => {
@@ -186,17 +288,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const saveNote = useCallback(
-    async (content: string, noteId?: string) => {
-      // Use provided noteId (for flush saves) or fall back to currentNote.id
-      const savingNoteId = noteId || currentNote?.id;
-      if (!savingNoteId) return;
+    async (note: Note, content: string): Promise<SaveResult<Note>> => {
+      const savingNoteId = note.id;
       let updatedId: string | null = null;
 
       try {
         // Mark this note as recently saved to ignore file-change events from our own save
         recentlySavedRef.current.add(savingNoteId);
 
-        const updated = await notesService.saveNote(savingNoteId, content);
+        const result = await notesService.saveNote(savingNoteId, content, note.content, note.path);
+        if (result.status === "conflict") {
+          recentlySavedRef.current.delete(savingNoteId);
+          return result;
+        }
+        const updated = result.note;
         updatedId = updated.id;
 
         // If the note was renamed (ID changed), also mark the new ID
@@ -217,23 +322,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           }
         }
 
-        // Clear external changes flag - if it was set by our own save, we want to ignore it
-        setHasExternalChanges(false);
-
-        // Only update state if we're still on the same note we started saving
-        // This prevents race conditions when user switches notes during save
-        setSelectedNoteId((prevId) => {
-          if (prevId === savingNoteId) {
-            // Update to the new ID if the note was renamed
-            setCurrentNote(updated);
-            return updated.id;
-          }
-          // User switched to a different note, don't update current note
-          return prevId;
-        });
+        // A completed save must not replace the note selected while it was in flight.
+        setCurrentNote(previous => previous?.path === note.path ? updated : previous);
+        if (updated.id !== savingNoteId) {
+          setSelectedNoteId(previous => previous === savingNoteId ? updated.id : previous);
+        }
 
         // Schedule refresh with debounce - avoids blocking typing during rapid saves
-        scheduleRefresh();
+        scheduleRefresh([folderParent(savingNoteId), folderParent(updated.id)]);
 
         // Clear the recently saved flag after a short delay
         // (longer than the file watcher debounce of 500ms)
@@ -241,14 +337,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           recentlySavedRef.current.delete(savingNoteId);
           if (updatedId) recentlySavedRef.current.delete(updatedId);
         }, 1000);
+        return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to save note");
         // Clean up immediately on error to avoid leaving stale entries
         recentlySavedRef.current.delete(savingNoteId);
         if (updatedId) recentlySavedRef.current.delete(updatedId);
+        throw err;
       }
     },
-    [currentNote, scheduleRefresh]
+    [scheduleRefresh]
   );
 
   const deleteNote = useCallback(
@@ -503,35 +600,64 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     [refreshNotes]
   );
 
+  const activateFolder = useCallback(async (path: string) => {
+    const request = ++browseRequestRef.current;
+    ++selectRequestIdRef.current;
+    ++searchRequestIdRef.current;
+    refreshPathsRef.current.clear();
+    setSelectedNoteId(null);
+    setCurrentNote(null);
+    setSearchQuery("");
+    setSearchResults([]);
+    setIsSearching(false);
+    setFlatNotes([]);
+    setTreeEntries(emptyEntries);
+    setLoadedFolders(new Set());
+    browseRef.current = null;
+    const settings = await notesService.getSettings();
+    if (browseRequestRef.current !== request) return;
+    const scope: BrowseState = {
+      root: path,
+      treeMode: settings.foldersEnabled !== false,
+      expanded: loadExpandedFolders(path),
+      listings: new Map(),
+      requests: new Map(),
+      requestId: 0,
+    };
+    browseRef.current = scope;
+    setFoldersEnabledState(scope.treeMode);
+    setExpandedFolders(scope.expanded);
+    setNotesFolderState(path);
+
+    // The sidebar can render as soon as the root is ready, independently of the watcher.
+    void notesService.startFileWatcher().catch(error => {
+      console.error("Failed to start file watcher:", error);
+    });
+    if (scope.treeMode) {
+      await loadFolders(scope, [""]);
+      if (scope.expanded.size && browseRef.current === scope) void loadFolders(scope, scope.expanded);
+    } else {
+      await refreshNotes();
+    }
+  }, [loadFolders, refreshNotes]);
+
   const setNotesFolder = useCallback(async (path: string) => {
     try {
       await notesService.setNotesFolder(path);
-      setNotesFolderState(path);
-      // Start file watcher after setting folder
-      await notesService.startFileWatcher();
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to set notes folder"
-      );
+      await activateFolder(path);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to set notes folder");
     }
-  }, []);
+  }, [activateFolder]);
 
-  // Update local state only (backend already initialized the folder).
-  // Used when the CLI sets the notes folder and emits an event.
+  // The CLI has already configured the new folder in the backend.
   const syncNotesFolder = useCallback(async (path: string) => {
     try {
-      setNotesFolderState(path);
-      setSelectedNoteId(null);
-      setCurrentNote(null);
-      const notesList = await notesService.listNotes();
-      setNotes(notesList);
-      await notesService.startFileWatcher();
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to sync notes folder"
-      );
+      await activateFolder(path);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to sync notes folder");
     }
-  }, []);
+  }, [activateFolder]);
 
   const search = useCallback(async (query: string) => {
     const requestId = ++searchRequestIdRef.current;
@@ -597,28 +723,30 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setIsSearching(false);
   }, []);
 
-  // Load initial state
   useEffect(() => {
-    async function init() {
-      try {
-        const folder = await notesService.getNotesFolder();
-        setNotesFolderState(folder);
-        if (folder) {
-          const notesList = await notesService.listNotes();
-          setNotes(notesList);
-          // Start file watcher
-          await notesService.startFileWatcher();
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to initialize");
-      } finally {
-        setIsLoading(false);
-      }
-    }
-    init();
-  }, []);
+    let cancelled = false;
+    notesService.getNotesFolder()
+      .then(folder => folder && !cancelled ? activateFolder(folder) : undefined)
+      .catch(error => { if (!cancelled) setError(String(error)); })
+      .finally(() => { if (!cancelled) setIsLoading(false); });
+    return () => { cancelled = true; };
+  }, [activateFolder]);
 
-  // Listen for file change events and notify if current note changed externally
+  useEffect(() => {
+    const onExpand = (event: Event) => expandFolder((event as CustomEvent<string>).detail);
+    window.addEventListener("expand-folder", onExpand);
+    return () => window.removeEventListener("expand-folder", onExpand);
+  }, [expandFolder]);
+
+  useEffect(() => {
+    const unlisten = listen<string>("folder-change", event => {
+      if (browseRef.current?.treeMode) scheduleRefresh([event.payload]);
+    });
+    return () => { void unlisten.then(dispose => dispose()); };
+  }, [scheduleRefresh]);
+
+  // Check the open note even when we just saved it. A different writer can
+  // change it again before our own file watcher event is delivered.
   useEffect(() => {
     let isCancelled = false;
     let unlisten: (() => void) | undefined;
@@ -634,15 +762,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         (id) => !recentlySavedRef.current.has(id)
       );
 
-      // Only refresh if there are external changes
-      if (externalChanges.length > 0) {
-        refreshNotes();
-
-        // If the currently selected note was changed externally, set flag (don't auto-reload)
-        const currentId = selectedNoteIdRef.current;
-        if (currentId && externalChanges.includes(currentId)) {
-          setHasExternalChanges(true);
-        }
+      if (externalChanges.length > 0) scheduleRefresh(externalChanges.map(folderParent));
+      const currentId = selectedNoteIdRef.current;
+      if (currentId && changedIds.includes(currentId)) {
+        reloadCurrentNote();
       }
     }).then((fn) => {
       if (isCancelled) {
@@ -659,7 +782,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         unlisten();
       }
     };
-  }, [refreshNotes]);
+  }, [reloadCurrentNote, scheduleRefresh]);
 
   // Listen for "select-note" events from the backend (CLI, drag-drop, Open With, import from preview)
   useEffect(() => {
@@ -673,17 +796,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     };
   }, [selectNote, refreshNotes]);
 
-  // Refresh notes when folder changes
-  useEffect(() => {
-    if (notesFolder) {
-      refreshNotes();
-    }
-  }, [notesFolder, refreshNotes]);
-
   // Memoize data context value to prevent unnecessary re-renders
   const dataValue = useMemo<NotesDataContextValue>(
     () => ({
       notes,
+      foldersEnabled,
+      knownFolders: treeEntries.folders,
+      loadedFolders,
+      expandedFolders,
       selectedNoteId,
       currentNote,
       notesFolder,
@@ -692,11 +812,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       searchQuery,
       searchResults,
       isSearching,
-      hasExternalChanges,
       reloadVersion,
     }),
     [
       notes,
+      foldersEnabled,
+      treeEntries.folders,
+      loadedFolders,
+      expandedFolders,
       selectedNoteId,
       currentNote,
       notesFolder,
@@ -705,7 +828,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       searchQuery,
       searchResults,
       isSearching,
-      hasExternalChanges,
       reloadVersion,
     ]
   );
@@ -717,9 +839,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       createNote,
       consumePendingNewNote,
       saveNote,
+      acceptDiskNote,
       deleteNote,
       duplicateNote,
       refreshNotes,
+      setFoldersEnabled,
+      expandFolder,
+      toggleFolder,
+      collapseAllFolders,
       reloadCurrentNote,
       setNotesFolder,
       syncNotesFolder,
@@ -739,9 +866,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       createNote,
       consumePendingNewNote,
       saveNote,
+      acceptDiskNote,
       deleteNote,
       duplicateNote,
       refreshNotes,
+      setFoldersEnabled,
+      expandFolder,
+      toggleFolder,
+      collapseAllFolders,
       reloadCurrentNote,
       setNotesFolder,
       syncNotesFolder,

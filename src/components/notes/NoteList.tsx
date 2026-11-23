@@ -241,6 +241,9 @@ export function NoteList({
 }: NoteListProps) {
   const {
     notes,
+    foldersEnabled,
+    knownFolders,
+    loadedFolders,
     selectedNoteId,
     selectNote,
     deleteNote,
@@ -330,10 +333,9 @@ export function NoteList({
       window.removeEventListener("request-delete-note", handleRequestDelete);
   }, [openDeleteDialogForNote]);
 
-  const foldersEnabled = settings?.foldersEnabled === true;
   const isSearching = searchQuery.trim().length > 0;
 
-  if (isLoading && notes.length === 0) {
+  if ((isLoading || (foldersEnabled && !isSearching && !loadedFolders.has(""))) && notes.length === 0) {
     return (
       <div className="p-4 text-center text-text-muted select-none">
         Loading...
@@ -349,7 +351,7 @@ export function NoteList({
     );
   }
 
-  if (displayItems.length === 0) {
+  if (displayItems.length === 0 && (!foldersEnabled || knownFolders.length === 0)) {
     return (
       <div className="p-4 text-center text-sm text-text-muted select-none">
         No notes yet
@@ -363,7 +365,6 @@ export function NoteList({
       <>
         <FolderTreeView
           pinnedIds={pinnedIds}
-          settings={settings}
           multiSelectedNoteIds={multiSelectedNoteIds}
           setMultiSelectedNoteIds={setMultiSelectedNoteIds}
           lastClickedNoteId={lastClickedNoteId}

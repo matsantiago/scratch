@@ -4,7 +4,6 @@ import { useDroppable, useDraggable } from "@dnd-kit/core";
 import { useNotes } from "../../context/NotesContext";
 import {
   buildFolderTree,
-  countNotesInFolder,
   getVisibleItems,
   type TreeItem,
 } from "../../lib/folderTree";
@@ -35,31 +34,12 @@ import {
   ArrowUpIcon,
 } from "../icons";
 import * as notesService from "../../services/notes";
-import type { FolderNode, NoteMetadata, Settings } from "../../types/note";
-
-const STORAGE_KEY = "scratch:collapsedFolders";
+import type { FolderNode, NoteMetadata } from "../../types/note";
 
 const menuItemClass =
   "px-3 py-1.5 text-sm text-text cursor-pointer outline-none hover:bg-bg-muted focus:bg-bg-muted flex items-center gap-2 rounded-sm";
 
 const menuSeparatorClass = "h-px bg-border my-1";
-
-function loadCollapsedFolders(): Set<string> {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? new Set(JSON.parse(saved)) : new Set();
-  } catch {
-    return new Set();
-  }
-}
-
-function saveCollapsedFolders(folders: Set<string>) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([...folders]));
-  } catch {
-    // Ignore localStorage errors
-  }
-}
 
 // Compact file item for folder tree (VS Code / Obsidian style)
 interface FileItemProps {
@@ -250,7 +230,8 @@ const FileItem = memo(function FileItem({
 interface FolderItemProps {
   folder: FolderNode;
   depth: number;
-  collapsedFolders: Set<string>;
+  expandedFolders: Set<string>;
+  loadedFolders: ReadonlySet<string>;
   onToggleCollapse: (path: string) => void;
   selectedNoteId: string | null;
   pinnedIds: Set<string>;
@@ -272,7 +253,8 @@ interface FolderItemProps {
 const FolderItemComponent = memo(function FolderItem({
   folder,
   depth,
-  collapsedFolders,
+  expandedFolders,
+  loadedFolders,
   onToggleCollapse,
   selectedNoteId,
   pinnedIds,
@@ -290,9 +272,9 @@ const FolderItemComponent = memo(function FolderItem({
   onMoveNoteToParent,
   onMoveFolderToParent,
 }: FolderItemProps) {
-  const isCollapsed = collapsedFolders.has(folder.path);
-  const noteCount = countNotesInFolder(folder);
-  const isEmpty = noteCount === 0 && folder.children.length === 0;
+  const isCollapsed = !expandedFolders.has(folder.path);
+  const isLoaded = loadedFolders.has(folder.path);
+  const isEmpty = folder.notes.length === 0 && folder.children.length === 0;
   const isFocused = focusedItemKey === `folder:${folder.path}`;
 
   const handleClick = useCallback(() => {
@@ -335,6 +317,7 @@ const FolderItemComponent = memo(function FolderItem({
             style={{ paddingLeft: `${depth * 12 + 8}px`, paddingRight: "8px" }}
             onClick={handleClick}
             role="button"
+            aria-expanded={!isCollapsed}
             tabIndex={-1}
           >
             {isCollapsed ? (
@@ -354,7 +337,8 @@ const FolderItemComponent = memo(function FolderItem({
                   key={child.path}
                   folder={child}
                   depth={depth + 1}
-                  collapsedFolders={collapsedFolders}
+                  expandedFolders={expandedFolders}
+                  loadedFolders={loadedFolders}
                   onToggleCollapse={onToggleCollapse}
                   selectedNoteId={selectedNoteId}
                   focusedItemKey={focusedItemKey}
@@ -390,12 +374,12 @@ const FolderItemComponent = memo(function FolderItem({
                   focusedItemKey={focusedItemKey}
                 />
               ))}
-              {isEmpty && (
+              {(!isLoaded || isEmpty) && (
                 <div
                   className="text-sm text-text-muted/50 py-1 select-none"
                   style={{ paddingLeft: `${(depth + 1) * 12 + 24}px` }}
                 >
-                  Empty
+                  {isLoaded ? "Empty" : "Loading…"}
                 </div>
               )}
             </div>
@@ -475,7 +459,6 @@ const FolderItemComponent = memo(function FolderItem({
 
 interface FolderTreeViewProps {
   pinnedIds: Set<string>;
-  settings: Settings | null;
   multiSelectedNoteIds: Set<string>;
   setMultiSelectedNoteIds: React.Dispatch<React.SetStateAction<Set<string>>>;
   lastClickedNoteId: string | null;
@@ -484,7 +467,6 @@ interface FolderTreeViewProps {
 
 export function FolderTreeView({
   pinnedIds,
-  settings: _settings,
   multiSelectedNoteIds,
   setMultiSelectedNoteIds,
   lastClickedNoteId,
@@ -492,6 +474,11 @@ export function FolderTreeView({
 }: FolderTreeViewProps) {
   const {
     notes,
+    knownFolders,
+    loadedFolders,
+    expandedFolders,
+    expandFolder,
+    toggleFolder: handleToggleCollapse,
     selectedNoteId,
     selectNote,
     createNoteInFolder,
@@ -506,8 +493,6 @@ export function FolderTreeView({
     moveFolder,
   } = useNotes();
 
-  const [collapsedFolders, setCollapsedFolders] =
-    useState<Set<string>>(loadCollapsedFolders);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [folderToDelete, setFolderToDelete] = useState<string | null>(null);
   const [renameDialogOpen, setRenameDialogOpen] = useState(false);
@@ -518,62 +503,12 @@ export function FolderTreeView({
   const [noteDeleteDialogOpen, setNoteDeleteDialogOpen] = useState(false);
   const [noteToDelete, setNoteToDelete] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
-  const [knownFolders, setKnownFolders] = useState<string[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
-
-  // Load known folders from disk (includes empty folders)
-  useEffect(() => {
-    notesService
-      .listFolders()
-      .then(setKnownFolders)
-      .catch(() => setKnownFolders([]));
-  }, [notes]);
-
-  // Persist collapsed state
-  useEffect(() => {
-    saveCollapsedFolders(collapsedFolders);
-  }, [collapsedFolders]);
 
   const tree = useMemo(
     () => buildFolderTree(notes, pinnedIds, knownFolders),
     [notes, pinnedIds, knownFolders],
   );
-
-  const handleToggleCollapse = useCallback((path: string) => {
-    setCollapsedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) {
-        next.delete(path);
-      } else {
-        next.add(path);
-      }
-      return next;
-    });
-  }, []);
-
-  // Expand a folder and all its ancestors
-  const expandFolder = useCallback((folderPath: string) => {
-    if (!folderPath) return;
-    setCollapsedFolders((prev) => {
-      const next = new Set(prev);
-      // Expand this folder and every ancestor
-      const parts = folderPath.split("/");
-      for (let i = 1; i <= parts.length; i++) {
-        next.delete(parts.slice(0, i).join("/"));
-      }
-      return next;
-    });
-  }, []);
-
-  // Listen for expand-folder events (from drag-drop in Sidebar, or search navigation)
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const path = (e as CustomEvent<string>).detail;
-      if (path) expandFolder(path);
-    };
-    window.addEventListener("expand-folder", handler);
-    return () => window.removeEventListener("expand-folder", handler);
-  }, [expandFolder]);
 
   const handleNewSubfolder = useCallback((parentPath: string) => {
     setSubfolderParent(parentPath);
@@ -663,8 +598,8 @@ export function FolderTreeView({
 
   // Flat list of visible items for keyboard navigation
   const visibleItems = useMemo(
-    () => getVisibleItems(tree, pinnedIds, collapsedFolders),
-    [tree, pinnedIds, collapsedFolders],
+    () => getVisibleItems(tree, pinnedIds, expandedFolders),
+    [tree, pinnedIds, expandedFolders],
   );
 
   // Visible note IDs in order (for Shift+Click range computation)
@@ -880,7 +815,8 @@ export function FolderTreeView({
             key={folder.path}
             folder={folder}
             depth={0}
-            collapsedFolders={collapsedFolders}
+            expandedFolders={expandedFolders}
+            loadedFolders={loadedFolders}
             onToggleCollapse={handleToggleCollapse}
             selectedNoteId={selectedNoteId}
             focusedItemKey={focusedItemKey}

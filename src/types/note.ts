@@ -13,6 +13,10 @@ export interface Note {
   modified: number;
 }
 
+export type SaveResult<T> =
+  | { status: "saved"; note: T }
+  | { status: "conflict"; disk: string | null };
+
 export interface ThemeSettings {
   mode: "light" | "dark" | "system";
 }
@@ -60,6 +64,11 @@ export interface Settings {
   ignoredPatterns?: string[];
   customColorsLight?: CustomColors;
   customColorsDark?: CustomColors;
+}
+
+export interface FolderListing {
+  folders: string[];
+  notes: NoteMetadata[];
 }
 
 export interface FolderNode {

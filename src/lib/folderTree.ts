@@ -1,8 +1,50 @@
-import type { NoteMetadata, FolderNode } from "../types/note";
+import type { NoteMetadata, FolderNode, FolderListing } from "../types/note";
 
 export interface FolderTreeData {
   rootNotes: NoteMetadata[];
   folders: FolderNode[];
+}
+
+export function folderParent(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash === -1 ? "" : path.slice(0, slash);
+}
+
+export function collectVisibleEntries(
+  listings: ReadonlyMap<string, FolderListing>,
+  expanded: ReadonlySet<string>,
+): FolderListing {
+  const result: FolderListing = { folders: [], notes: [] };
+  function visit(path: string) {
+    const listing = listings.get(path);
+    if (!listing) return;
+    for (const note of listing.notes) result.notes.push(note);
+    for (const child of listing.folders) {
+      result.folders.push(child);
+      if (expanded.has(child)) visit(child);
+    }
+  }
+  visit("");
+  result.notes.sort((first, second) => second.modified - first.modified);
+  return result;
+}
+const expansionKey = (root: string) => `scratch:expandedFolders:${root}`;
+
+export function loadExpandedFolders(root: string): Set<string> {
+  try {
+    const paths: unknown = JSON.parse(localStorage.getItem(expansionKey(root)) ?? "[]");
+    return new Set(Array.isArray(paths) ? paths.filter((path): path is string => typeof path === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function saveExpandedFolders(root: string, expanded: Set<string>): void {
+  try {
+    localStorage.setItem(expansionKey(root), JSON.stringify([...expanded]));
+  } catch {
+    // Browsing does not require local storage.
+  }
 }
 
 export function buildFolderTree(
@@ -87,7 +129,7 @@ export type TreeItem =
 export function getVisibleItems(
   tree: FolderTreeData,
   pinnedIds: Set<string>,
-  collapsedFolders: Set<string>,
+  expandedFolders: Set<string>,
 ): TreeItem[] {
   const items: TreeItem[] = [];
 
@@ -101,7 +143,7 @@ export function getVisibleItems(
   // Folders (recursive DFS)
   function walkFolder(folder: FolderNode) {
     items.push({ type: "folder", path: folder.path });
-    if (!collapsedFolders.has(folder.path)) {
+    if (expandedFolders.has(folder.path)) {
       for (const child of folder.children) {
         walkFolder(child);
       }
@@ -122,12 +164,4 @@ export function getVisibleItems(
   }
 
   return items;
-}
-
-export function countNotesInFolder(folder: FolderNode): number {
-  let count = folder.notes.length;
-  for (const child of folder.children) {
-    count += countNotesInFolder(child);
-  }
-  return count;
 }

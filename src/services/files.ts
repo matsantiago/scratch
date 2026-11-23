@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { SaveResult } from "../types/note";
 
 export interface FileContent {
   path: string;
@@ -7,15 +8,16 @@ export interface FileContent {
   modified: number;
 }
 
-export async function readFileDirect(path: string): Promise<FileContent> {
+export async function readFileDirect(path: string): Promise<FileContent | null> {
   return invoke("read_file_direct", { path });
 }
 
 export async function saveFileDirect(
   path: string,
   content: string,
-): Promise<FileContent> {
-  return invoke("save_file_direct", { path, content });
+  expectedContent: string,
+): Promise<SaveResult<FileContent>> {
+  return invoke("save_file_direct", { path, content, expectedContent });
 }
 
 export async function openFilePreview(path: string): Promise<void> {

@@ -1,7 +1,7 @@
 import { Extension } from "@tiptap/core";
 import { PluginKey } from "@tiptap/pm/state";
 import { ReactRenderer } from "@tiptap/react";
-import Suggestion from "@tiptap/suggestion";
+import Suggestion, { type SuggestionProps } from "@tiptap/suggestion";
 import tippy, { type Instance as TippyInstance } from "tippy.js";
 import type { NoteMetadata } from "../../types/note";
 import type { WikilinkStorage } from "./Wikilink";
@@ -16,6 +16,9 @@ export const WikilinkSuggestion = Extension.create({
   name: "wikilinkSuggestion",
 
   addProseMirrorPlugins() {
+    const storage = () => (
+      this.editor.storage as unknown as { wikilink?: WikilinkStorage }
+    ).wikilink;
     return [
       Suggestion<NoteMetadata>({
         editor: this.editor,
@@ -33,13 +36,8 @@ export const WikilinkSuggestion = Extension.create({
         },
 
         items: ({ query }) => {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const notes = (
-            (this.editor.storage as any).wikilink as WikilinkStorage | undefined
-          )?.notes;
-          if (!notes) return [];
           const q = query.toLowerCase();
-          return notes
+          return (storage()?.notes ?? [])
             .filter((note) => note.title.toLowerCase().includes(q))
             .slice(0, 10);
         },
@@ -60,6 +58,23 @@ export const WikilinkSuggestion = Extension.create({
           let component: ReactRenderer<WikilinkSuggestionListRef> | null =
             null;
           let popup: TippyInstance | null = null;
+          let timer: number | undefined;
+          let request = 0;
+
+          function searchMore({ query, items }: SuggestionProps<NoteMetadata>) {
+            clearTimeout(timer);
+            const id = ++request;
+            const searchTitles = storage()?.searchTitles;
+            if (!query?.trim() || items.length >= 10 || !searchTitles) return;
+            timer = window.setTimeout(() => {
+              void searchTitles(query).then(matches => {
+                if (id !== request) return;
+                const byId = new Map(items.map(note => [note.id, note]));
+                for (const note of matches) byId.set(note.id, note);
+                component?.updateProps({ items: [...byId.values()].slice(0, 10) });
+              }).catch(error => console.error("Failed to search wikilink titles:", error));
+            }, 150);
+          }
 
           return {
             onStart: (props) => {
@@ -90,6 +105,7 @@ export const WikilinkSuggestion = Extension.create({
                   ],
                 },
               });
+              searchMore(props);
             },
 
             onUpdate: (props) => {
@@ -102,6 +118,7 @@ export const WikilinkSuggestion = Extension.create({
                 getReferenceClientRect: () =>
                   props.clientRect?.() ?? new DOMRect(),
               });
+              searchMore(props);
             },
 
             onKeyDown: (props) => {
@@ -113,6 +130,8 @@ export const WikilinkSuggestion = Extension.create({
             },
 
             onExit: () => {
+              clearTimeout(timer);
+              request++;
               popup?.destroy();
               component?.destroy();
               popup = null;

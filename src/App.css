@@ -428,6 +428,7 @@ html.dark {
   border-radius: 0.5rem;
   padding: 2rem 1rem 0.75rem;
   overflow-x: auto;
+  tab-size: 2;
 }
 
 .code-block-wrapper pre code {
@@ -462,7 +463,8 @@ html.dark {
   position: relative;
 }
 
-.mermaid-diagram svg {
+.mermaid-diagram svg,
+.mermaid-diagram img {
   max-width: 100%;
   height: auto;
 }
@@ -1210,7 +1212,8 @@ table.not-prose th {
   }
 
   /* Mermaid diagrams: avoid page breaks */
-  .mermaid-diagram svg {
+  .mermaid-diagram svg,
+  .mermaid-diagram img {
     max-width: 100% !important;
     break-inside: avoid;
   }

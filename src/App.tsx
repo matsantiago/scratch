@@ -153,8 +153,7 @@ function AppContent() {
           result = await aiService.executeClaudeEdit(currentNote.path, prompt);
         }
 
-        // Reload the current note from disk
-        await reloadCurrentNote();
+        reloadCurrentNote();
 
         // Show results
         if (result.success) {

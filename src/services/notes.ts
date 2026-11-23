@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Note, NoteMetadata, Settings } from "../types/note";
+import type { FolderListing, Note, NoteMetadata, SaveResult, Settings } from "../types/note";
 
 export async function getNotesFolder(): Promise<string | null> {
   return invoke("get_notes_folder");
@@ -17,8 +17,13 @@ export async function readNote(id: string): Promise<Note> {
   return invoke("read_note", { id });
 }
 
-export async function saveNote(id: string | null, content: string): Promise<Note> {
-  return invoke("save_note", { id, content });
+export async function saveNote(
+  id: string,
+  content: string,
+  expectedContent: string,
+  expectedPath: string,
+): Promise<SaveResult<Note>> {
+  return invoke("save_note", { id, content, expectedContent, expectedPath });
 }
 
 export async function deleteNote(id: string): Promise<void> {
@@ -29,8 +34,8 @@ export async function createNote(targetFolder?: string): Promise<Note> {
   return invoke("create_note", { targetFolder: targetFolder ?? null });
 }
 
-export async function listFolders(): Promise<string[]> {
-  return invoke("list_folders");
+export async function listFolderEntries(parent: string): Promise<FolderListing> {
+  return invoke("list_folder_entries", { parent });
 }
 
 export async function createFolder(path: string): Promise<void> {
@@ -61,7 +66,9 @@ export async function duplicateNote(id: string): Promise<Note> {
   const newNote = await createNote(folder);
   // Save with the original content (title will be extracted from content)
   const duplicatedContent = original.content.replace(/^# (.+)$/m, (_, title) => `# ${title} (Copy)`);
-  return saveNote(newNote.id, duplicatedContent || original.content);
+  const result = await saveNote(newNote.id, duplicatedContent || original.content, newNote.content, newNote.path);
+  if (result.status === "conflict") throw new Error("The copy was changed on disk");
+  return result.note;
 }
 
 export async function getSettings(): Promise<Settings> {
@@ -92,6 +99,10 @@ export interface SearchResult {
 
 export async function searchNotes(query: string): Promise<SearchResult[]> {
   return invoke("search_notes", { query });
+}
+
+export async function findNoteTitles(query: string, exact = false): Promise<NoteMetadata[]> {
+  return invoke("find_note_titles", { query, exact });
 }
 
 export async function startFileWatcher(): Promise<void> {

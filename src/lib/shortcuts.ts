@@ -42,6 +42,9 @@ export const shortcutCategories: ShortcutCategory[] = [
     title: "Editor",
     shortcuts: [
       { keys: [alt, "↑ / ↓"], description: "Move line up / down" },
+      { keys: [alt, shift, "↑ / ↓"], description: "Duplicate code line up / down" },
+      { keys: ["Tab"], description: "Indent code" },
+      { keys: [shift, "Tab"], description: "Outdent code" },
       { keys: [mod, "B"], description: "Bold" },
       { keys: [mod, "I"], description: "Italic" },
       { keys: [mod, "K"], description: "Add / edit link" },

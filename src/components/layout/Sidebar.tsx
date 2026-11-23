@@ -19,12 +19,12 @@ import {
   XIcon,
   SearchIcon,
   SearchOffIcon,
+  CollapseAllIcon,
   AddNoteIcon,
   FolderPlusIcon,
   NoteIcon,
 } from "../icons";
 import { mod, shift, isMac, isWindows } from "../../lib/platform";
-import * as notesService from "../../services/notes";
 import { FolderNameDialog } from "../notes/FolderNameDialog";
 
 interface SidebarProps {
@@ -36,6 +36,9 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     createNote,
     createFolder,
     notes,
+    foldersEnabled,
+    expandedFolders,
+    collapseAllFolders,
     search,
     searchQuery,
     clearSearch,
@@ -48,7 +51,6 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const [folderDialogOpen, setFolderDialogOpen] = useState(false);
   const [folderDialogParent, setFolderDialogParent] = useState("");
-  const [foldersEnabled, setFoldersEnabled] = useState(true);
   const [dragLabel, setDragLabel] = useState<string | null>(null);
   const [dragCount, setDragCount] = useState(1);
   const [multiSelectedNoteIds, setMultiSelectedNoteIds] = useState<Set<string>>(new Set());
@@ -164,16 +166,6 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     },
     [moveNote, moveFolder],
   );
-
-  // Load folders setting
-  useEffect(() => {
-    notesService.getSettings().then((s) => {
-      setFoldersEnabled(s.foldersEnabled === true);
-    }).catch((error) => {
-      console.error("Failed to load settings:", error);
-      setFoldersEnabled(false);
-    });
-  }, []);
 
   // Sync input with search query
   useEffect(() => {
@@ -316,9 +308,11 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
       <div className={`flex items-center justify-between pl-4 pr-3 pb-2 border-b border-border shrink-0${isWindows ? " pt-2" : ""}`}>
         <div className="flex items-center gap-1">
           <div className="font-medium text-base">Notes</div>
-          <div className="text-text-muted font-medium text-2xs min-w-4.75 h-4.75 flex items-center justify-center px-1 bg-bg-muted rounded-sm mt-0.5 pt-px">
-            {notes.length}
-          </div>
+          {!foldersEnabled && (
+            <div className="text-text-muted font-medium text-2xs min-w-4.75 h-4.75 flex items-center justify-center px-1 bg-bg-muted rounded-sm mt-0.5 pt-px">
+              {notes.length}
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-px">
           <IconButton
@@ -331,6 +325,18 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
               <SearchIcon className="w-4.25 h-4.25 stroke-[1.5]" />
             )}
           </IconButton>
+          {foldersEnabled && (
+            <IconButton
+              type="button"
+              title="Collapse All Folders"
+              tabIndex={0}
+              aria-disabled={expandedFolders.size === 0}
+              className="aria-disabled:opacity-50 aria-disabled:cursor-default"
+              onClick={collapseAllFolders}
+            >
+              <CollapseAllIcon className="w-4.25 h-4.25 stroke-[1.5]" />
+            </IconButton>
+          )}
           {foldersEnabled ? (
             <DropdownMenu.Root
               open={plusMenuOpen}
