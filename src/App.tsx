@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { toast } from "sonner";
 import { NotesProvider, useNotes } from "./context/NotesContext";
 import { ThemeProvider, useTheme } from "./context/ThemeContext";
-import { listen } from "@tauri-apps/api/event";
 import { GitProvider } from "./context/GitContext";
 import { TooltipProvider, Toaster } from "./components/ui";
 import { Sidebar } from "./components/layout/Sidebar";
@@ -62,9 +61,8 @@ function AppContent() {
     searchResults,
     reloadCurrentNote,
     currentNote,
-    syncNotesFolder,
   } = useNotes();
-  const { interfaceZoom, setInterfaceZoom, reloadSettings } = useTheme();
+  const { interfaceZoom, setInterfaceZoom } = useTheme();
   const interfaceZoomRef = useRef(interfaceZoom);
   interfaceZoomRef.current = interfaceZoom;
   const currentNoteRef = useRef(currentNote);
@@ -78,24 +76,6 @@ function AppContent() {
   const [focusMode, setFocusMode] = useState(false);
   const [aiProvider, setAiProvider] = useState<AiProvider>("claude");
   const editorRef = useRef<TiptapEditor | null>(null);
-
-  // Keep this window in sync when the CLI or another window changes the notes folder.
-  // Placed here in AppContent where both NotesContext and ThemeContext are available
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    listen<string>("set-notes-folder", async (event) => {
-      await syncNotesFolder(event.payload);
-      await reloadSettings();
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [syncNotesFolder, reloadSettings]);
 
   const toggleSidebar = useCallback(() => {
     setSidebarVisible((prev) => !prev);

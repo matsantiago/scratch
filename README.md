@@ -108,10 +108,13 @@ Scratch is designed to be usable without a mouse. Here are the essentials to get
 
 Many more shortcuts and features are available in the app—explore via the command palette (`Cmd+P` / `Ctrl+P`) or view the full reference in Settings → Shortcuts.
 
-On macOS, choose **File → New Window** or press `Cmd+Shift+N` to open another Scratch window. For a global keyboard shortcut, add a **Run Shell Script** action in Shortcuts with this command and assign a keyboard shortcut in the shortcut's details.
+On macOS, choose **File → New Window** or press `Cmd+Shift+N` to open a window and choose its notes folder. You can also reopen the most recently used folder. Each window edits and searches its own folder. Opening Scratch normally restores the last chosen folder. For a global keyboard shortcut, add a **Run Shell Script** action in Shortcuts with this command and assign a keyboard shortcut in the shortcut's details.
 
 ```sh
 /usr/bin/open -n -a /Applications/Scratch.app --args --new-window
+
+# Open a specific notes folder directly in a new window
+/usr/bin/open -n -a /Applications/Scratch.app --args --new-window "/path/to/notes"
 ```
 
 ## Built With

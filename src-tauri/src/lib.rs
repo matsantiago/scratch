@@ -11,7 +11,7 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow};
 use tauri::webview::WebviewWindowBuilder;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tokio::fs;
@@ -161,7 +161,6 @@ pub struct AiExecutionResult {
 
 // File watcher state
 pub struct FileWatcherState {
-    folder: String,
     #[allow(dead_code)]
     watcher: RecommendedWatcher,
 }
@@ -177,10 +176,11 @@ pub struct SearchIndex {
     title_field: Field,
     content_field: Field,
     modified_field: Field,
+    _directory: tempfile::TempDir,
 }
 
 impl SearchIndex {
-    fn new(index_path: &PathBuf) -> Result<Self> {
+    fn new() -> Result<Self> {
         // Build schema
         let mut schema_builder = Schema::builder();
         let id_field = schema_builder.add_text_field("id", STRING | STORED);
@@ -189,10 +189,9 @@ impl SearchIndex {
         let modified_field = schema_builder.add_i64_field("modified", INDEXED | STORED);
         let schema = schema_builder.build();
 
-        // Create or open index
-        std::fs::create_dir_all(index_path)?;
-        let index = Index::create_in_dir(index_path, schema.clone())
-            .or_else(|_| Index::open_in_dir(index_path))?;
+        // Each live workspace owns its index. Rebuild lazily from Markdown.
+        let directory = tempfile::tempdir()?;
+        let index = Index::create_in_dir(directory.path(), schema.clone())?;
 
         let reader = index
             .reader_builder()
@@ -210,6 +209,7 @@ impl SearchIndex {
             title_field,
             content_field,
             modified_field,
+            _directory: directory,
         })
     }
 
@@ -353,8 +353,8 @@ impl SearchIndex {
 }
 
 // App state with improved structure
-pub struct AppState {
-    pub app_config: RwLock<AppConfig>,  // notes_folder path (stored in app data)
+pub struct WorkspaceData {
+    folder: Option<String>,
     pub settings: RwLock<Settings>,      // per-folder settings (stored in .scratch/)
     pub notes_cache: RwLock<HashMap<String, NoteMetadata>>,
     pub file_watcher: Mutex<Option<FileWatcherState>>,
@@ -365,11 +365,94 @@ pub struct AppState {
     pub debounce_map: Arc<Mutex<HashMap<PathBuf, Instant>>>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
+#[derive(Clone, Default)]
+struct Workspace(Arc<WorkspaceData>);
+
+impl std::ops::Deref for Workspace {
+    type Target = WorkspaceData;
+    fn deref(&self) -> &WorkspaceData { &self.0 }
+}
+
+// Resolve the calling window once, before an async command can yield.
+impl<'de> tauri::ipc::CommandArg<'de, tauri::Wry> for Workspace {
+    fn from_command(command: tauri::ipc::CommandItem<'de, tauri::Wry>) -> Result<Self, tauri::ipc::InvokeError> {
+        let webview = command.message.webview();
+        let registry = webview.state::<Workspaces>();
+        let windows = registry.0.lock().expect("workspace registry");
+        windows.bindings.get(webview.label()).cloned().ok_or_else(|| "Window has no workspace binding".into())
+    }
+}
+
+#[derive(Default)]
+struct WindowFolders {
+    bindings: HashMap<String, Workspace>,
+    recent: Workspace,
+    folders: HashMap<String, std::sync::Weak<WorkspaceData>>,
+}
+
+impl WindowFolders {
+    fn for_folder(&mut self, folder: String) -> Workspace {
+        if let Some(runtime) = self.folders.get(&folder).and_then(|entry| entry.upgrade()) {
+            return Workspace(runtime);
+        }
+        self.folders.retain(|_, entry| entry.strong_count() > 0);
+        let state = Workspace(Arc::new(WorkspaceData::new(Some(folder.clone()))));
+        self.folders.insert(folder, Arc::downgrade(&state.0));
+        state
+    }
+}
+
+#[derive(Default)]
+struct Workspaces(Mutex<WindowFolders>);
+
+impl Workspaces {
+    fn recent(&self) -> Workspace {
+        self.0.lock().expect("workspace registry").recent.clone()
+    }
+
+    fn bind(&self, label: &str, state: Workspace) {
+        let previous = self.0.lock().expect("workspace registry").bindings.insert(label.into(), state);
+        drop(previous);
+    }
+
+    fn remove(&self, label: &str) {
+        let previous = self.0.lock().expect("workspace registry").bindings.remove(label);
+        drop(previous);
+    }
+
+    fn labels(&self, state: &Workspace) -> Vec<String> {
+        self.0.lock().expect("workspace registry").bindings.iter()
+            .filter(|(label, bound)| is_workspace_window(label) && Arc::ptr_eq(&bound.0, &state.0))
+            .map(|(label, _)| label.clone()).collect()
+    }
+}
+
+impl Workspace {
+    fn root(&self) -> Result<String, String> {
+        self.folder.clone().ok_or_else(|| "Notes folder not set".into())
+    }
+}
+
+impl Drop for WorkspaceData {
+    fn drop(&mut self) {
+        // The final reference can be released by a notification callback. The
+        // macOS watcher joins its callback thread when dropped.
+        if let Some(watcher) = self.file_watcher.get_mut().expect("file watcher mutex").take() {
+            std::thread::spawn(move || drop(watcher));
+        }
+    }
+}
+
+impl Default for WorkspaceData {
+    fn default() -> Self { Self::new(None) }
+}
+
+impl WorkspaceData {
+    fn new(folder: Option<String>) -> Self {
+        let settings = folder.as_deref().map(load_settings).unwrap_or_default();
         Self {
-            app_config: RwLock::new(AppConfig::default()),
-            settings: RwLock::new(Settings::default()),
+            folder,
+            settings: RwLock::new(settings),
             notes_cache: RwLock::new(HashMap::new()),
             file_watcher: Mutex::new(None),
             search_index: Mutex::new(None),
@@ -755,13 +838,6 @@ fn get_settings_path(notes_folder: &str) -> PathBuf {
     scratch_dir.join("settings.json")
 }
 
-// Get search index path
-fn get_search_index_path(app: &AppHandle) -> Result<PathBuf> {
-    let app_data = app.path().app_data_dir()?;
-    std::fs::create_dir_all(&app_data)?;
-    Ok(app_data.join("search_index"))
-}
-
 // Load app config from disk (notes folder path)
 fn load_app_config(app: &AppHandle) -> AppConfig {
     let path = match get_app_config_path(app) {
@@ -782,8 +858,9 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
 // Save app config to disk
 fn save_app_config(app: &AppHandle, config: &AppConfig) -> Result<()> {
     let path = get_app_config_path(app)?;
-    let content = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, content)?;
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().expect("app data directory"))?;
+    serde_json::to_writer_pretty(file.as_file_mut(), config)?;
+    file.persist(path)?;
     Ok(())
 }
 
@@ -834,95 +911,47 @@ fn normalize_notes_folder_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(trimmed))
 }
 
-/// Shared initialization logic for setting a notes folder.
-/// Creates required directories, verifies write access, updates config/settings,
-/// grants asset access, and invalidates the old workspace's search index.
-fn initialize_notes_folder(app: &AppHandle, path_buf: &PathBuf, state: &AppState) -> Result<String, String> {
-    let normalized_path = path_buf.to_string_lossy().into_owned();
-
-    // Verify it's a valid directory
-    if !path_buf.exists() {
-        std::fs::create_dir_all(path_buf).map_err(|e| e.to_string())?;
-    }
-
-    // Create assets folder
-    let assets = path_buf.join("assets");
-    std::fs::create_dir_all(&assets).map_err(|e| e.to_string())?;
-
-    // Create .scratch config folder
-    let scratch_dir = path_buf.join(".scratch");
-    std::fs::create_dir_all(&scratch_dir).map_err(|e| e.to_string())?;
-
-    // Verify write access early to avoid later silent failures
-    let write_test_path = scratch_dir.join(".write-test");
-    std::fs::write(&write_test_path, b"ok")
-        .map_err(|e| format!("Notes folder is not writable: {}", e))?;
-    let _ = std::fs::remove_file(&write_test_path);
-
-    // Load per-folder settings (starts fresh with defaults if none exist)
-    let settings = load_settings(&normalized_path);
-
-    // Update app config
-    {
-        let mut app_config = state.app_config.write().expect("app_config write lock");
-        app_config.notes_folder = Some(normalized_path.clone());
-    }
-
-    // Update settings in memory
-    {
-        let mut current_settings = state.settings.write().expect("settings write lock");
-        *current_settings = settings;
-    }
-
-    // Save app config to disk
-    {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        save_app_config(app, &app_config).map_err(|e| e.to_string())?;
-    }
-
-    // Add notes folder to asset protocol scope so images can be served
-    let _ = app.asset_protocol_scope().allow_directory(path_buf, true);
-
-    invalidate_search_index(state);
-    state.notes_cache.write().expect("cache write lock").clear();
-
-    Ok(normalized_path)
-}
-
-// TAURI COMMANDS
-
-#[tauri::command]
-fn get_notes_folder(state: State<AppState>) -> Option<String> {
-    state
-        .app_config
-        .read()
-        .expect("app_config read lock")
-        .notes_folder
-        .clone()
+fn prepare_folder(app: &AppHandle, path: &str) -> Result<Workspace, String> {
+    let path = normalize_notes_folder_path(path)?.canonicalize().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(path.join("assets")).map_err(|e| e.to_string())?;
+    let config_dir = path.join(".scratch");
+    std::fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
+    tempfile::NamedTempFile::new_in(&config_dir).map_err(|e| format!("Notes folder is not writable: {e}"))?;
+    app.asset_protocol_scope().allow_directory(&path, true).map_err(|e| e.to_string())?;
+    let folder = path.to_string_lossy().into_owned();
+    let registry = app.state::<Workspaces>();
+    let mut windows = registry.0.lock().expect("workspace registry");
+    save_app_config(app, &AppConfig { notes_folder: Some(folder.clone()) }).map_err(|e| e.to_string())?;
+    let state = windows.for_folder(folder);
+    let previous = std::mem::replace(&mut windows.recent, state.clone());
+    drop(windows);
+    drop(previous);
+    Ok(state)
 }
 
 #[tauri::command]
-fn set_notes_folder(window: WebviewWindow, path: String, state: State<AppState>) -> Result<String, String> {
-    let path_buf = normalize_notes_folder_path(&path)?;
+fn get_notes_folder(state: Workspace) -> Option<String> {
+    state.folder.clone()
+}
+
+#[tauri::command]
+fn get_recent_folder(app: AppHandle) -> Option<String> {
+    app.state::<Workspaces>().recent().folder.clone()
+}
+
+#[tauri::command]
+fn set_notes_folder(window: WebviewWindow, path: String) -> Result<String, String> {
     let app = window.app_handle();
-    let folder = initialize_notes_folder(app, &path_buf, &state)?;
-    for label in app.webview_windows().keys() {
-        if is_workspace_window(label) && label != window.label() {
-            let _ = app.emit_to(label.as_str(), "set-notes-folder", &folder);
-        }
-    }
+    let state = prepare_folder(app, &path)?;
+    let folder = state.folder.clone().expect("prepared folder");
+    app.state::<Workspaces>().bind(window.label(), state);
+    let _ = window.set_title(&workspace_title(&folder));
     Ok(folder)
 }
 
 #[tauri::command]
-async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+async fn list_notes(state: Workspace) -> Result<Vec<NoteMetadata>, String> {
+    let folder = state.root()?;
 
     let path = PathBuf::from(&folder);
     if !path.exists() {
@@ -1000,30 +1029,18 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
         }
     });
 
-    // Update cache efficiently
-    {
-        let config = state.app_config.read().expect("app_config read lock");
-        if config.notes_folder.as_deref() == Some(folder.as_str()) {
-            let mut cache = state.notes_cache.write().expect("cache write lock");
-            cache.clear();
-            for note in &notes {
-                cache.insert(note.id.clone(), note.clone());
-            }
-        }
+    let mut cache = state.notes_cache.write().expect("cache write lock");
+    cache.clear();
+    for note in &notes {
+        cache.insert(note.id.clone(), note.clone());
     }
 
     Ok(notes)
 }
 
 #[tauri::command]
-async fn read_note(id: String, state: State<'_, AppState>) -> Result<Note, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+async fn read_note(id: String, state: Workspace) -> Result<Note, String> {
+    let folder = state.root()?;
 
     let folder_path = PathBuf::from(&folder);
     let file_path = abs_path_from_id(&folder_path, &id)?;
@@ -1060,19 +1077,13 @@ async fn save_note(
     content: String,
     expected_content: Option<String>,
     expected_path: Option<String>,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<SaveResult<Note>, String> {
     let _save = SAVE_LOCK.lock().await;
     if id.is_some() && (expected_content.is_none() || expected_path.is_none()) {
         return Err("The original note is required to save".to_string());
     }
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
     let folder_path = PathBuf::from(&folder);
 
     let title = extract_title(&content);
@@ -1189,14 +1200,8 @@ async fn save_note(
 }
 
 #[tauri::command]
-async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+async fn delete_note(id: String, state: Workspace) -> Result<(), String> {
+    let folder = state.root()?;
 
     let folder_path = PathBuf::from(&folder);
     let file_path = abs_path_from_id(&folder_path, &id)?;
@@ -1224,14 +1229,8 @@ async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
-async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) -> Result<Note, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+async fn create_note(target_folder: Option<String>, state: Workspace) -> Result<Note, String> {
+    let folder = state.root()?;
     let folder_path = PathBuf::from(&folder);
 
     // Get template from settings (default "Untitled")
@@ -1411,10 +1410,9 @@ fn read_folder_entries(root: &Path, relative: &str, ignored: &[String]) -> Resul
 #[tauri::command]
 async fn list_folder_entries(
     parent: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<FolderListing, String> {
-    let root = state.app_config.read().expect("app_config read lock")
-        .notes_folder.clone().ok_or("Notes folder not set")?;
+    let root = state.root()?;
     let ignored = get_effective_ignored_dirs(&state.settings.read().expect("settings read lock"));
     tokio::task::spawn_blocking(move || read_folder_entries(Path::new(&root), &parent, &ignored))
         .await
@@ -1453,13 +1451,51 @@ mod folder_listing_tests {
     }
 
     #[test]
+    fn windows_isolate_reads_saves_and_search_for_same_named_notes() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let registry = Workspaces::default();
+        let workspace = |name: &str| -> Result<Workspace, String> {
+            let path = temp.path().join(name);
+            std::fs::create_dir_all(&path).map_err(|err| err.to_string())?;
+            Ok(registry.0.lock().unwrap().for_folder(path.to_string_lossy().into_owned()))
+        };
+        let first = workspace("alpha")?;
+        let second = workspace("beta")?;
+        registry.bind("main", first.clone());
+        registry.bind("workspace-1", second.clone());
+        registry.bind("workspace-2", workspace("alpha")?);
+        assert_eq!(registry.labels(&first).len(), 2);
+        assert_eq!(registry.labels(&second), ["workspace-1"]);
+        tauri::async_runtime::block_on(async {
+            for (state, text) in [(&first, "orchid"), (&second, "quartz")] {
+                std::fs::write(Path::new(&state.root()?).join("Shared.md"), format!("# Shared\n\n{text}"))
+                    .map_err(|err| err.to_string())?;
+            }
+            let note = read_note("Shared".into(), first.clone()).await?;
+            let content = "# Shared\n\nmarigold".to_string();
+            let save = save_note(Some(note.id.clone()), content.clone(), Some(note.content.clone()),
+                Some(note.path.clone()), first.clone()).await?;
+            assert!(matches!(save, SaveResult::Saved { .. }));
+            assert!(save_note(Some(note.id), content, Some(note.content), Some(note.path), second.clone()).await.is_err());
+            assert_eq!(read_note("Shared".into(), second.clone()).await?.content, "# Shared\n\nquartz");
+            assert_eq!(search_notes("marigold".into(), first.clone()).await?.len(), 1);
+            assert!(search_notes("marigold".into(), second.clone()).await?.is_empty());
+            assert_eq!(search_notes("quartz".into(), second.clone()).await?.len(), 1);
+            registry.bind("workspace-2", second.clone());
+            registry.remove("main");
+            assert!(registry.labels(&first).is_empty());
+            assert_eq!(registry.labels(&second).len(), 2);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn search_can_index_a_note_in_a_closed_branch() -> Result<()> {
         let root = tempfile::tempdir()?;
         let repo = root.path().join("repo/docs");
         std::fs::create_dir_all(&repo)?;
         std::fs::write(repo.join("Hidden.md"), "# Example\n\norchid")?;
-        let index_dir = tempfile::tempdir()?;
-        let index = SearchIndex::new(&index_dir.path().to_path_buf())?;
+        let index = SearchIndex::new()?;
         assert!(index.search("orchid", 20)?.is_empty());
         index.rebuild_index(root.path(), &[], || true)?;
         let results = index.search("orchid", 20)?;
@@ -1469,14 +1505,8 @@ mod folder_listing_tests {
 }
 
 #[tauri::command]
-async fn create_folder(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+async fn create_folder(path: String, state: Workspace) -> Result<(), String> {
+    let folder = state.root()?;
 
     validate_folder_path(&path)?;
 
@@ -1494,14 +1524,8 @@ async fn create_folder(path: String, state: State<'_, AppState>) -> Result<(), S
 }
 
 #[tauri::command]
-async fn delete_folder(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+async fn delete_folder(path: String, state: Workspace) -> Result<(), String> {
+    let folder = state.root()?;
 
     validate_folder_path(&path)?;
 
@@ -1535,15 +1559,9 @@ async fn delete_folder(path: String, state: State<'_, AppState>) -> Result<(), S
 async fn rename_folder(
     old_path: String,
     new_name: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
 
     validate_folder_path(&old_path)?;
 
@@ -1635,15 +1653,9 @@ async fn rename_folder(
 async fn move_note(
     id: String,
     target_folder: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<String, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
     let folder_root = PathBuf::from(&folder);
     let source_path = abs_path_from_id(&folder_root, &id)?;
 
@@ -1713,15 +1725,9 @@ async fn move_note(
 async fn move_folder(
     path: String,
     target_parent: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
 
     validate_folder_path(&path)?;
     if !target_parent.is_empty() {
@@ -1815,19 +1821,16 @@ async fn move_folder(
 }
 
 #[tauri::command]
-fn get_settings(state: State<AppState>) -> Settings {
+fn get_settings(state: Workspace) -> Settings {
     state.settings.read().expect("settings read lock").clone()
 }
 
 #[tauri::command]
 fn update_settings(
     new_settings: Settings,
-    state: State<AppState>,
+    state: Workspace,
 ) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
 
     {
         let mut settings = state.settings.write().expect("settings write lock");
@@ -1844,18 +1847,12 @@ fn update_settings(
 fn update_git_enabled(
     enabled: Option<bool>,
     expected_folder: String,
-    state: State<AppState>,
+    state: Workspace,
 ) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        let folder = app_config.notes_folder.clone().ok_or("Notes folder not set")?;
-
-        if folder != expected_folder {
-            return Err("Notes folder changed".to_string());
-        }
-
-        folder
-    };
+    let folder = state.root()?;
+    if folder != expected_folder {
+        return Err("Notes folder changed".into());
+    }
 
     {
         let mut settings = state.settings.write().expect("settings write lock");
@@ -2007,20 +2004,14 @@ async fn save_file_direct(
 async fn import_file_to_folder(
     app: AppHandle,
     path: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<NoteMetadata, String> {
     let source = validate_preview_path(&path)?;
     if !source.is_file() {
         return Err(format!("Not a file: {}", path));
     }
 
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
     let folder_path = PathBuf::from(&folder);
 
     // Read the source file content
@@ -2102,21 +2093,20 @@ async fn import_file_to_folder(
         cache.insert(metadata.id.clone(), metadata.clone());
     }
 
-    if let Err(error) = open_workspace_note(&app, &metadata.id, None) {
+    if let Err(error) = open_workspace_note(&app, &metadata.id, &state, None) {
         eprintln!("Could not show imported note: {error}");
     }
 
     Ok(metadata)
 }
 
-async fn ensure_search_index(app: &AppHandle, state: &AppState) -> Result<()> {
+async fn ensure_search_index(state: &Workspace) -> Result<()> {
     if state.search_index.lock().expect("search index mutex").is_some() {
         return Ok(());
     }
     let _build = state.search_build_lock.lock().await;
-    let app = app.clone();
+    let state = state.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let state = app.state::<AppState>();
         let generation = {
             let index = state.search_index.lock().expect("search index mutex");
             if index.is_some() {
@@ -2126,13 +2116,13 @@ async fn ensure_search_index(app: &AppHandle, state: &AppState) -> Result<()> {
             state.search_generation.load(Ordering::Relaxed)
         };
         let current = || generation == state.search_generation.load(Ordering::Relaxed);
-        let folder = state.app_config.read().expect("app_config read lock").notes_folder.clone();
+        let folder = state.folder.clone();
         let Some(folder) = folder else { return Ok(()) };
         let root = Path::new(&folder);
         let ignored = get_effective_ignored_dirs(&state.settings.read().expect("settings read lock"));
 
         let build = || -> Result<Option<(SearchIndex, Vec<NoteMetadata>)>> {
-            let index = SearchIndex::new(&get_search_index_path(&app)?)?;
+            let index = SearchIndex::new()?;
             Ok(index.rebuild_index(root, &ignored, current)?.map(|notes| (index, notes)))
         };
         let built = build();
@@ -2182,13 +2172,13 @@ fn update_indexed_note(
 }
 
 #[tauri::command]
-async fn search_notes(query: String, app: AppHandle, state: State<'_, AppState>) -> Result<Vec<SearchResult>, String> {
+async fn search_notes(query: String, state: Workspace) -> Result<Vec<SearchResult>, String> {
     let trimmed_query = query.trim().to_string();
     if trimmed_query.is_empty() {
         return Ok(vec![]);
     }
 
-    if let Err(error) = ensure_search_index(&app, &state).await {
+    if let Err(error) = ensure_search_index(&state).await {
         eprintln!("Could not initialize search: {error}");
         let _ = list_notes(state.clone()).await;
     }
@@ -2222,14 +2212,13 @@ async fn search_notes(query: String, app: AppHandle, state: State<'_, AppState>)
 async fn find_note_titles(
     query: String,
     exact: bool,
-    app: AppHandle,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<Vec<NoteMetadata>, String> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    if ensure_search_index(&app, &state).await.is_err() {
+    if ensure_search_index(&state).await.is_err() {
         let _ = list_notes(state.clone()).await;
     }
     let cache = state.notes_cache.read().expect("cache read lock");
@@ -2242,11 +2231,8 @@ async fn find_note_titles(
 }
 
 // Fallback search when Tantivy index isn't available - searches title and full content
-async fn fallback_search(query: &str, state: &State<'_, AppState>) -> Result<Vec<SearchResult>, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn fallback_search(query: &str, state: &Workspace) -> Result<Vec<SearchResult>, String> {
+    let folder = state.folder.clone();
 
     let folder = match folder {
         Some(f) => f,
@@ -2327,6 +2313,7 @@ fn setup_file_watcher(
     app: AppHandle,
     notes_folder: &str,
     debounce_map: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    runtime: std::sync::Weak<WorkspaceData>,
 ) -> Result<FileWatcherState, String> {
     let folder_path = PathBuf::from(notes_folder);
     let notes_root = folder_path.clone();
@@ -2335,13 +2322,9 @@ fn setup_file_watcher(
     let watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                let Some(state) = app_handle.try_state::<AppState>() else {
-                    return;
-                };
-                let active_root = state.app_config.read().expect("app_config read lock").notes_folder.clone();
-                if active_root.as_deref().map(Path::new) != Some(notes_root.as_path()) {
-                    return;
-                }
+                let Some(runtime) = runtime.upgrade() else { return };
+                let state = Workspace(runtime);
+                let labels = app_handle.state::<Workspaces>().labels(&state);
                 let ignored_dirs = get_effective_ignored_dirs(&state.settings.read().expect("settings read lock"));
                 for path in event.paths.iter() {
                     let note_id = match id_from_abs_path(&notes_root, path, &ignored_dirs) {
@@ -2357,7 +2340,9 @@ fn setup_file_watcher(
                                 || (!matches!(event.kind, notify::EventKind::Access(_)) && path.is_dir())
                             {
                                 if let Some(parent) = relative.parent() {
-                                    let _ = app_handle.emit("folder-change", parent.to_string_lossy().replace('\\', "/"));
+                                    for label in &labels {
+                                        let _ = app_handle.emit_to(label.as_str(), "folder-change", parent.to_string_lossy().replace('\\', "/"));
+                                    }
                                 }
                             }
                             continue;
@@ -2411,14 +2396,14 @@ fn setup_file_watcher(
                         kind
                     };
 
-                    let _ = app_handle.emit(
-                        "file-change",
-                        FileChangeEvent {
-                            kind: effective_kind.to_string(),
-                            path: path.to_string_lossy().into_owned(),
-                            changed_ids: vec![note_id.clone()],
-                        },
-                    );
+                    let change = FileChangeEvent {
+                        kind: effective_kind.to_string(),
+                        path: path.to_string_lossy().into_owned(),
+                        changed_ids: vec![note_id.clone()],
+                    };
+                    for label in &labels {
+                        let _ = app_handle.emit_to(label.as_str(), "file-change", &change);
+                    }
                 }
             }
         },
@@ -2433,21 +2418,14 @@ fn setup_file_watcher(
         .watch(&folder_path, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
 
-    Ok(FileWatcherState { folder: notes_folder.to_owned(), watcher })
+    Ok(FileWatcherState { watcher })
 }
 
 #[tauri::command]
-async fn start_file_watcher(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+async fn start_file_watcher(app: AppHandle, state: Workspace) -> Result<(), String> {
+    let folder = state.root()?;
 
-    let watching_folder = |watcher: &FileWatcherState| watcher.folder == folder;
-    if state.file_watcher.lock().expect("file watcher mutex").as_ref().is_some_and(watching_folder) {
+    if state.file_watcher.lock().expect("file watcher mutex").is_some() {
         return Ok(());
     }
 
@@ -2456,23 +2434,15 @@ async fn start_file_watcher(app: AppHandle, state: State<'_, AppState>) -> Resul
 
     let debounce_map = Arc::clone(&state.debounce_map);
     let requested_folder = folder.clone();
-    let watcher = tokio::task::spawn_blocking(move || setup_file_watcher(app, &requested_folder, debounce_map))
+    let runtime = Arc::downgrade(&state.0);
+    let watcher = tokio::task::spawn_blocking(move || setup_file_watcher(app, &requested_folder, debounce_map, runtime))
         .await
         .map_err(|error| error.to_string())??;
 
-    let previous = {
-        let config = state.app_config.read().expect("app_config read lock");
-        if config.notes_folder.as_deref() != Some(folder.as_str()) {
-            return Ok(());
-        }
-        let mut file_watcher = state.file_watcher.lock().expect("file watcher mutex");
-        if file_watcher.as_ref().is_some_and(watching_folder) {
-            return Ok(());
-        }
-        file_watcher.replace(watcher)
-    };
-    drop(previous);
-
+    let mut current = state.file_watcher.lock().expect("file watcher mutex");
+    if current.is_none() {
+        *current = Some(watcher);
+    }
     Ok(())
 }
 
@@ -2484,20 +2454,14 @@ fn copy_to_clipboard(app: AppHandle, text: String) -> Result<(), String> {
 #[tauri::command]
 async fn save_clipboard_image(
     base64_data: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<String, String> {
     // Guard against empty clipboard payload
     if base64_data.trim().is_empty() {
         return Err("Clipboard data is empty".to_string());
     }
 
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
 
     // Decode base64
     let image_data = base64::engine::general_purpose::STANDARD
@@ -2543,15 +2507,9 @@ async fn save_clipboard_image(
 #[tauri::command]
 async fn copy_image_to_assets(
     source_path: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<String, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config
-            .notes_folder
-            .clone()
-            .ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
 
     let source = PathBuf::from(&source_path);
     if !source.exists() {
@@ -2607,7 +2565,7 @@ async fn copy_image_to_assets(
     Ok(format!("assets/{}", target_name))
 }
 
-fn invalidate_search_index(state: &AppState) {
+fn invalidate_search_index(state: &WorkspaceData) {
     let mut index = state.search_index.lock().expect("search index mutex");
     state.search_generation.fetch_add(1, Ordering::Relaxed);
     *state.search_changes.lock().expect("search changes mutex") = None;
@@ -2615,7 +2573,7 @@ fn invalidate_search_index(state: &AppState) {
 }
 
 #[tauri::command]
-fn rebuild_search_index(state: State<'_, AppState>) {
+fn rebuild_search_index(state: Workspace) {
     invalidate_search_index(&state);
 }
 
@@ -2718,11 +2676,8 @@ async fn git_is_available() -> bool {
 }
 
 #[tauri::command]
-async fn git_get_status(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_get_status(state: Workspace) -> Result<git::GitStatus, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2737,11 +2692,8 @@ async fn git_get_status(state: State<'_, AppState>) -> Result<git::GitStatus, St
 }
 
 #[tauri::command]
-async fn git_init_repo(state: State<'_, AppState>) -> Result<(), String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
-    };
+async fn git_init_repo(state: Workspace) -> Result<(), String> {
+    let folder = state.root()?;
 
     tauri::async_runtime::spawn_blocking(move || {
         git::git_init(&PathBuf::from(folder))
@@ -2751,11 +2703,8 @@ async fn git_init_repo(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn git_commit(message: String, state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_commit(message: String, state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2774,11 +2723,8 @@ async fn git_commit(message: String, state: State<'_, AppState>) -> Result<git::
 }
 
 #[tauri::command]
-async fn git_push(state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_push(state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2797,11 +2743,8 @@ async fn git_push(state: State<'_, AppState>) -> Result<git::GitResult, String> 
 }
 
 #[tauri::command]
-async fn git_fetch(state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_fetch(state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2820,11 +2763,8 @@ async fn git_fetch(state: State<'_, AppState>) -> Result<git::GitResult, String>
 }
 
 #[tauri::command]
-async fn git_pull(state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_pull(state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2843,11 +2783,8 @@ async fn git_pull(state: State<'_, AppState>) -> Result<git::GitResult, String> 
 }
 
 #[tauri::command]
-async fn git_add_remote(url: String, state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_add_remote(url: String, state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2866,11 +2803,8 @@ async fn git_add_remote(url: String, state: State<'_, AppState>) -> Result<git::
 }
 
 #[tauri::command]
-async fn git_set_remote_url(url: String, state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_set_remote_url(url: String, state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2889,11 +2823,8 @@ async fn git_set_remote_url(url: String, state: State<'_, AppState>) -> Result<g
 }
 
 #[tauri::command]
-async fn git_remove_remote(state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_remove_remote(state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -2912,11 +2843,8 @@ async fn git_remove_remote(state: State<'_, AppState>) -> Result<git::GitResult,
 }
 
 #[tauri::command]
-async fn git_push_with_upstream(state: State<'_, AppState>) -> Result<git::GitResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone()
-    };
+async fn git_push_with_upstream(state: Workspace) -> Result<git::GitResult, String> {
+    let folder = state.folder.clone();
 
     match folder {
         Some(path) => {
@@ -3415,12 +3343,9 @@ async fn execute_ai_cli(
 async fn ai_execute_claude(
     file_path: String,
     prompt: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<AiExecutionResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("markdown") {
@@ -3483,12 +3408,9 @@ async fn ai_execute_codex(file_path: String, prompt: String) -> Result<AiExecuti
 async fn ai_execute_opencode(
     file_path: String,
     prompt: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<AiExecutionResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("markdown") {
@@ -3550,12 +3472,9 @@ async fn ai_execute_ollama(
     file_path: String,
     prompt: String,
     model: String,
-    state: State<'_, AppState>,
+    state: Workspace,
 ) -> Result<AiExecutionResult, String> {
-    let folder = {
-        let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
-    };
+    let folder = state.root()?;
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("markdown") {
@@ -3694,14 +3613,7 @@ fn is_workspace_window(label: &str) -> bool {
     label == "main" || label.starts_with(WORKSPACE_WINDOW_PREFIX)
 }
 
-fn workspace_window(app: &AppHandle, preferred: Option<&str>) -> Option<WebviewWindow> {
-    if let Some(window) = preferred
-        .filter(|label| is_workspace_window(label))
-        .and_then(|label| app.get_webview_window(label))
-    {
-        return Some(window);
-    }
-
+fn workspace_window(app: &AppHandle) -> Option<WebviewWindow> {
     app.webview_windows()
         .into_values()
         .filter(|window| is_workspace_window(window.label()))
@@ -3712,20 +3624,31 @@ fn workspace_window(app: &AppHandle, preferred: Option<&str>) -> Option<WebviewW
         ))
 }
 
-fn create_workspace_window(app: &AppHandle, note: Option<&str>) -> tauri::Result<WebviewWindow> {
+fn workspace_title(folder: &str) -> String {
+    let name = Path::new(folder).file_name().and_then(|s| s.to_str()).unwrap_or(folder);
+    format!("{name} — Scratch")
+}
+
+fn create_workspace_window(app: &AppHandle, state: Workspace, note: Option<&str>) -> tauri::Result<WebviewWindow> {
     let mut config = app.config().app.windows.iter()
         .find(|window| window.label == "main")
         .expect("main window configuration")
         .clone();
     let id = NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
     config.label = format!("{WORKSPACE_WINDOW_PREFIX}{id}");
+    if let Some(folder) = &state.folder {
+        config.title = workspace_title(folder);
+    }
     config.visible = true;
     config.focus = true;
     if let Some(note) = note {
         let encoded = urlencoding::encode(note);
         config.url = WebviewUrl::App(format!("index.html?note={encoded}").into());
     }
-    WebviewWindowBuilder::from_config(app, &config)?.build()
+    let builder = WebviewWindowBuilder::from_config(app, &config)?;
+    let registry = app.state::<Workspaces>();
+    registry.bind(&config.label, state);
+    builder.build().inspect_err(|_| registry.remove(&config.label))
 }
 
 fn focus_workspace_window(window: &WebviewWindow) -> tauri::Result<()> {
@@ -3735,27 +3658,35 @@ fn focus_workspace_window(window: &WebviewWindow) -> tauri::Result<()> {
 }
 
 fn show_workspace(app: &AppHandle) -> tauri::Result<()> {
-    let window = match workspace_window(app, None) {
+    let window = match workspace_window(app) {
         Some(window) => window,
-        None => create_workspace_window(app, None)?,
+        None => create_workspace_window(app, app.state::<Workspaces>().recent(), None)?,
     };
     focus_workspace_window(&window)
 }
 
 fn new_workspace_window(app: &AppHandle) {
-    let result = create_workspace_window(app, None).and_then(|window| focus_workspace_window(&window));
+    let result = create_workspace_window(app, Workspace::default(), None).and_then(|window| focus_workspace_window(&window));
     if let Err(error) = result {
         eprintln!("Could not open a new Scratch window: {error}");
     }
 }
 
-fn open_workspace_note(app: &AppHandle, id: &str, preferred: Option<&str>) -> tauri::Result<()> {
-    let window = match workspace_window(app, preferred) {
+fn open_workspace_note(app: &AppHandle, id: &str, state: &Workspace, preferred: Option<&str>) -> tauri::Result<()> {
+    let labels = app.state::<Workspaces>().labels(state);
+    let target = labels.iter()
+        .filter_map(|label| app.get_webview_window(label))
+        .max_by_key(|window| (
+            Some(window.label()) == preferred,
+            window.is_focused().unwrap_or(false),
+            window.is_visible().unwrap_or(false),
+        ));
+    let window = match target {
         Some(window) => {
             app.emit_to(window.label(), "select-note", id)?;
             window
         }
-        None => create_workspace_window(app, Some(id))?,
+        None => create_workspace_window(app, state.clone(), Some(id))?,
     };
     focus_workspace_window(&window)
 }
@@ -3781,45 +3712,27 @@ fn app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
 
 /// Opens a note in the workspace if it is inside the configured notes folder.
 fn try_select_in_notes_folder(app: &AppHandle, path: &Path, preferred: Option<&str>) -> bool {
-    let state = match app.try_state::<AppState>() {
-        Some(s) => s,
-        None => return false,
+    let Ok(file) = path.canonicalize() else { return false };
+    let Some(registry) = app.try_state::<Workspaces>() else { return false };
+    let mut candidates: Vec<_> = {
+        let windows = registry.0.lock().expect("workspace registry");
+        windows.bindings.iter().filter(|(label, _)| is_workspace_window(label))
+            .map(|(label, state)| (Some(label.clone()), state.clone()))
+            .chain(std::iter::once((None, windows.recent.clone()))).collect()
     };
-
-    let notes_folder = state
-        .app_config
-        .read()
-        .expect("app_config read lock")
-        .notes_folder
-        .clone();
-
-    let folder = match notes_folder {
-        Some(f) => f,
-        None => return false,
-    };
-
-    let folder_path = PathBuf::from(&folder);
-    let (canonical_file, canonical_folder) = match (path.canonicalize(), folder_path.canonicalize())
-    {
-        (Ok(f), Ok(d)) => (f, d),
-        _ => return false,
-    };
-
-    if !canonical_file.starts_with(&canonical_folder) {
-        return false;
+    candidates.sort_by_key(|(label, state)| std::cmp::Reverse((
+        preferred.is_some() && label.as_deref() == preferred,
+        state.folder.as_ref().map_or(0, String::len),
+        label.is_some(),
+    )));
+    for (_, state) in candidates {
+        let Some(folder) = &state.folder else { continue };
+        let ignored = get_effective_ignored_dirs(&state.settings.read().expect("settings read lock"));
+        if let Some(id) = id_from_abs_path(Path::new(folder), &file, &ignored) {
+            return open_workspace_note(app, &id, &state, preferred).is_ok();
+        }
     }
-
-    let ignored_dirs = {
-        let settings = state.settings.read().expect("settings read lock");
-        get_effective_ignored_dirs(&settings)
-    };
-
-    let note_id = match id_from_abs_path(&canonical_folder, &canonical_file, &ignored_dirs) {
-        Some(id) => id,
-        None => return false,
-    };
-
-    open_workspace_note(app, &note_id, preferred).is_ok()
+    false
 }
 
 /// Check if a file extension is a supported markdown extension.
@@ -3859,7 +3772,7 @@ fn watch_preview_file(app: &AppHandle, label: &str, path: &str) -> Result<Recomm
 }
 
 // Preview mode: create a lightweight window for editing a single file
-fn create_preview_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
+fn create_preview_window(app: &AppHandle, file_path: &str, source: Option<&str>) -> Result<(), String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -3894,8 +3807,13 @@ fn create_preview_window(app: &AppHandle, file_path: &str) -> Result<(), String>
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
 
-    let window = builder
-        .build()
+    let registry = app.state::<Workspaces>();
+    let workspace = {
+        let windows = registry.0.lock().expect("workspace registry");
+        source.and_then(|label| windows.bindings.get(label)).unwrap_or(&windows.recent).clone()
+    };
+    registry.bind(&label, workspace);
+    let window = builder.build().inspect_err(|_| registry.remove(&label))
         .map_err(|e| format!("Failed to create preview window: {}", e))?;
 
     match watch_preview_file(app, &label, file_path) {
@@ -3923,21 +3841,22 @@ fn create_preview_window(app: &AppHandle, file_path: &str) -> Result<(), String>
 }
 
 #[tauri::command]
-fn open_file_preview(app: AppHandle, path: String) -> Result<(), String> {
+fn open_file_preview(window: WebviewWindow, path: String) -> Result<(), String> {
     let file_path = PathBuf::from(&path);
     if !file_path.exists() {
         return Err(format!("File not found: {}", path));
     }
 
-    if !try_select_in_notes_folder(&app, &file_path, None) {
-        create_preview_window(&app, &path)?;
+    let app = window.app_handle();
+    if !try_select_in_notes_folder(app, &file_path, Some(window.label())) {
+        create_preview_window(app, &path, Some(window.label()))?;
     }
     Ok(())
 }
 
 // Handle CLI arguments: open .md files in preview mode.
 // Returns true if a standalone preview window was created (file outside notes folder).
-fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
+fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str, cold: bool) -> bool {
     let mut opened_file = false;
     let mut opened_preview = false;
 
@@ -3956,31 +3875,31 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
         if is_markdown_extension(&path) && path.is_file() {
             opened_file = true;
             if !try_select_in_notes_folder(app, &path, None)
-                && create_preview_window(app, &path.to_string_lossy()).is_ok()
+                && create_preview_window(app, &path.to_string_lossy(), None).is_ok()
             {
                 opened_preview = true;
             }
         } else if path.is_dir() {
-            let canonical = path.canonicalize().unwrap_or(path.clone());
-            let state = app.state::<AppState>();
-            // Full initialization: directory creation, write-access check,
-            // asset-scope update, config/settings persist, and search-index rebuild
-            match initialize_notes_folder(app, &canonical, &state) {
-                Ok(normalized_path) => {
-                    // Emit event for when app is already running (single-instance)
-                    let _ = app.emit("set-notes-folder", normalized_path);
-                    opened_file = true;
+            match prepare_folder(app, &path.to_string_lossy()) {
+                Ok(state) => {
+                    let result = if cold && !opened_file {
+                        app.state::<Workspaces>().bind("main", state);
+                        Ok(())
+                    } else {
+                        create_workspace_window(app, state, None).and_then(|w| focus_workspace_window(&w))
+                    };
+                    if let Err(e) = result { eprintln!("Could not open folder: {e}"); }
+                    else { opened_file = true; }
                 }
-                Err(e) => {
-                    eprintln!("Failed to initialize notes folder {:?}: {}", canonical, e);
-                }
+                Err(e) => eprintln!("Could not open folder: {e}"),
             }
-            let _ = show_workspace(app);
         }
     }
 
     // A plain launch focuses an existing workspace.
-    if !opened_file {
+    if !opened_file && !cold && args.iter().skip(1).any(|arg| arg == NEW_WINDOW_ARG) {
+        new_workspace_window(app);
+    } else if !opened_file {
         let _ = show_workspace(app);
     }
 
@@ -4034,12 +3953,10 @@ pub fn run() {
     let app = builder
         // Single-instance: forward CLI args from subsequent launches to the running instance
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            if args.iter().skip(1).any(|arg| arg == NEW_WINDOW_ARG) {
-                let app = app.clone();
-                tauri::async_runtime::spawn_blocking(move || new_workspace_window(&app));
-            } else {
-                handle_cli_args(app, &args, &cwd);
-            }
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                handle_cli_args(&app, &args, &cwd, false);
+            });
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
@@ -4072,51 +3989,36 @@ pub fn run() {
                 }
             }
 
-            // Load per-folder settings if notes folder is set
-            let settings = if let Some(ref folder) = app_config.notes_folder {
-                load_settings(folder)
-            } else {
-                Settings::default()
-            };
-
-            let state = AppState {
-                app_config: RwLock::new(app_config),
-                settings: RwLock::new(settings),
-                ..AppState::default()
-            };
-            app.manage(state);
-
-            // Add notes folder to asset protocol scope so images can be served
-            if let Some(ref folder) = app.state::<AppState>().app_config.read().expect("app_config read lock").notes_folder.clone() {
-                let _ = app.asset_protocol_scope().allow_directory(folder, true);
-            }
-
-            // Handle CLI args on first launch; determine whether to show the main window.
-            // When a standalone preview is opened (file outside the notes folder) and the
-            // notes folder is already configured, the main window is closed so users only
-            // see the preview. When no notes folder is configured yet, the main window is
-            // always shown so new users can complete onboarding via the FolderPicker.
             let args: Vec<String> = std::env::args().collect();
-            // On a cold --new-window launch the initial workspace is already the new window.
-            let opened_preview = if args.len() > 1 && !args.iter().skip(1).any(|arg| arg == NEW_WINDOW_ARG) {
+            let mut windows = WindowFolders::default();
+            if let Some(folder) = app_config.notes_folder {
+                let folder = Path::new(&folder).canonicalize().unwrap_or_else(|_| folder.into());
+                let _ = app.asset_protocol_scope().allow_directory(&folder, true);
+                windows.recent = windows.for_folder(folder.to_string_lossy().into_owned());
+            }
+            let initial = if args.iter().skip(1).any(|arg| arg == NEW_WINDOW_ARG) {
+                Workspace::default()
+            } else { windows.recent.clone() };
+            windows.bindings.insert("main".into(), initial);
+            app.manage(Workspaces(Mutex::new(windows)));
+
+            let opened_preview = if args.len() > 1 {
                 let cwd = std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                handle_cli_args(app.handle(), &args, &cwd)
+                handle_cli_args(app.handle(), &args, &cwd, true)
             } else {
                 false
             };
 
             if let Some(main_window) = app.get_webview_window("main") {
-                let has_notes_folder = app
-                    .state::<AppState>()
-                    .app_config
-                    .read()
-                    .expect("app_config read lock")
-                    .notes_folder
-                    .is_some();
+                let has_notes_folder = app.state::<Workspaces>().recent().folder.is_some();
 
+                let registry = app.state::<Workspaces>();
+                let folder = registry.0.lock().expect("workspace registry").bindings.get("main")
+                    .and_then(|state| state.folder.clone());
+                if let Some(folder) = folder { let _ = main_window.set_title(&workspace_title(&folder)); }
                 if opened_preview && has_notes_folder {
                     // Existing user: notes folder is configured and a standalone preview
                     // was opened. Close the hidden main window so only the preview is visible.
@@ -4133,6 +4035,9 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(registry) = window.try_state::<Workspaces>() { registry.remove(window.label()); }
+            }
             // Handle drag-and-drop of .md files onto any window
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 let app = window.app_handle();
@@ -4141,13 +4046,14 @@ pub fn run() {
                         && path.is_file()
                         && !try_select_in_notes_folder(app, path, Some(window.label()))
                     {
-                        let _ = create_preview_window(app, &path.to_string_lossy());
+                        let _ = create_preview_window(app, &path.to_string_lossy(), Some(window.label()));
                     }
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
             get_notes_folder,
+            get_recent_folder,
             set_notes_folder,
             list_notes,
             read_note,
@@ -4217,7 +4123,7 @@ pub fn run() {
                             && path.is_file()
                             && !try_select_in_notes_folder(_app_handle, &path, None)
                         {
-                            let _ = create_preview_window(_app_handle, &path.to_string_lossy());
+                            let _ = create_preview_window(_app_handle, &path.to_string_lossy(), None);
                         }
                     }
                 }
@@ -4288,7 +4194,7 @@ mod windows_title_bar {
 
 #[tauri::command]
 fn set_title_bar_theme(
-    app: AppHandle,
+    window: WebviewWindow,
     is_dark: bool,
     r: u8,
     g: u8,
@@ -4296,15 +4202,11 @@ fn set_title_bar_theme(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        for (label, window) in app.webview_windows() {
-            if is_workspace_window(&label) || label.starts_with("preview-") {
-                windows_title_bar::apply_title_bar_theme(&window, is_dark, (r, g, b));
-            }
-        }
+        windows_title_bar::apply_title_bar_theme(&window, is_dark, (r, g, b));
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, is_dark, r, g, b);
+        let _ = (window, is_dark, r, g, b);
     }
     Ok(())
 }

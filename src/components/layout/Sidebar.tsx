@@ -36,6 +36,7 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     createNote,
     createFolder,
     notes,
+    notesFolder,
     foldersEnabled,
     expandedFolders,
     collapseAllFolders,
@@ -306,8 +307,10 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
       {/* Drag region */}
       {!isWindows && <div className="h-11 shrink-0" data-tauri-drag-region></div>}
       <div className={`flex items-center justify-between pl-4 pr-3 pb-2 border-b border-border shrink-0${isWindows ? " pt-2" : ""}`}>
-        <div className="flex items-center gap-1">
-          <div className="font-medium text-base">Notes</div>
+        <div className="flex min-w-0 items-center gap-1">
+          <div className="truncate font-medium text-base" title={notesFolder ?? undefined}>
+            {notesFolder?.split(/[\\/]/).filter(Boolean).pop() || notesFolder || "Notes"}
+          </div>
           {!foldersEnabled && (
             <div className="text-text-muted font-medium text-2xs min-w-4.75 h-4.75 flex items-center justify-center px-1 bg-bg-muted rounded-sm mt-0.5 pt-px">
               {notes.length}

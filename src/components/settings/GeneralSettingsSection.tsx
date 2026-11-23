@@ -248,7 +248,7 @@ export function GeneralSettingsSection() {
       <section className="pb-2">
         <h2 className="text-xl font-medium mb-0.5">Folder Location</h2>
         <p className="text-sm text-text-muted mb-4">
-          Your notes are stored as markdown files in this folder
+          This window reads and saves its Markdown notes in this folder.
         </p>
         <div className="flex items-center gap-2.5 p-2.5 rounded-[10px] border border-border mb-2.5">
           <div className="p-2 rounded-md bg-bg-muted">

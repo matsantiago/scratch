@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useNotes } from "../../context/NotesContext";
 import { useTheme } from "../../context/ThemeContext";
@@ -5,8 +7,26 @@ import { Button } from "../ui";
 import { isWindows } from "../../lib/platform";
 
 export function FolderPicker() {
-  const { setNotesFolder } = useNotes();
+  const { setNotesFolder, error } = useNotes();
   const { reloadSettings } = useTheme();
+
+  const [recent, setRecent] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
+  useEffect(() => {
+    invoke<string | null>("get_recent_folder").then(setRecent).catch(console.error);
+  }, []);
+
+  const openFolder = async (folder: string) => {
+    setOpening(true);
+    try {
+      await setNotesFolder(folder);
+      await reloadSettings();
+    } catch (err) {
+      console.error("Could not open folder:", err);
+    } finally {
+      setOpening(false);
+    }
+  };
 
   const handleSelectFolder = async () => {
     try {
@@ -17,9 +37,7 @@ export function FolderPicker() {
       });
 
       if (selected && typeof selected === "string") {
-        await setNotesFolder(selected);
-        // Reload theme/font settings from the new folder's .scratch/settings.json
-        await reloadSettings();
+        await openFolder(selected);
       }
     } catch (err) {
       console.error("Failed to select folder:", err);
@@ -55,30 +73,30 @@ export function FolderPicker() {
             className="text-3xl text-text font-serif mb-2 tracking-[-0.01em] animate-fade-in-up"
             style={{ animationDelay: "100ms" }}
           >
-            Welcome to Scratch
+            {recent ? "Open a notes folder" : "Welcome to Scratch"}
           </h1>
           <p
             className="text-text-muted mb-6 animate-fade-in-up"
             style={{ animationDelay: "100ms" }}
           >
-            Scratch is an offline-first notes app. Your notes are simply stored
-            on your computer as markdown files.
+            Choose the folder of Markdown notes to use in this window.
           </p>
           <div
             className="animate-fade-in-up"
             style={{ animationDelay: "200ms" }}
           >
-            <Button onClick={handleSelectFolder} size="xl">
+            <Button disabled={opening} onClick={handleSelectFolder} size="xl">
               Choose your notes folder
             </Button>
           </div>
 
-          <p
-            className="mt-2 text-xs text-text-muted/60 animate-fade-in-up"
-            style={{ animationDelay: "300ms" }}
-          >
-            You can change this later
-          </p>
+          {recent && (
+            <Button variant="link" disabled={opening} title={recent} className="mt-2 max-w-full"
+              onClick={() => void openFolder(recent)}>
+              <span className="truncate">Reopen {recent}</span>
+            </Button>
+          )}
+          {error && <p role="alert" className="mt-2 text-sm">{error}</p>}
         </div>
       </div>
     </div>

@@ -1,5 +1,4 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { toast } from "sonner";
 import { Editor, type PreviewModeData } from "../editor/Editor";
@@ -50,7 +49,7 @@ export function PreviewApp({ filePath }: PreviewAppProps) {
   const reload = useCallback(() => setReloadVersion(version => version + 1), []);
 
   useEffect(() => {
-    const unlisten = listen("preview-file-change", reload);
+    const unlisten = getCurrentWindow().listen("preview-file-change", reload);
     return () => {
       unlisten.then(fn => fn());
     };

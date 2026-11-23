@@ -1,3 +1,4 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   createContext,
   useContext,
@@ -8,7 +9,6 @@ import {
   useRef,
   type ReactNode,
 } from "react";
-import { listen } from "@tauri-apps/api/event";
 import * as gitService from "../services/git";
 import * as notesService from "../services/notes";
 import type { GitStatus } from "../services/git";
@@ -436,7 +436,7 @@ export function GitProvider({ children }: { children: ReactNode }) {
     let unlisten: (() => void) | undefined;
     let debounceTimer: number | undefined;
 
-    listen("file-change", () => {
+    getCurrentWindow().listen("file-change", () => {
       if (!gitEnabledRef.current) return;
 
       // Debounce git status refresh to avoid excessive calls

@@ -1,3 +1,4 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   createContext,
   useContext,
@@ -8,7 +9,6 @@ import {
   useRef,
   type ReactNode,
 } from "react";
-import { listen } from "@tauri-apps/api/event";
 import type { FolderListing, Note, NoteMetadata, SaveResult } from "../types/note";
 import * as notesService from "../services/notes";
 import type { SearchResult } from "../services/notes";
@@ -60,7 +60,6 @@ interface NotesActionsContextValue {
   collapseAllFolders: () => void;
   reloadCurrentNote: () => void;
   setNotesFolder: (path: string) => Promise<void>;
-  syncNotesFolder: (path: string) => Promise<void>;
   search: (query: string) => Promise<void>;
   clearSearch: () => void;
   pinNote: (id: string) => Promise<void>;
@@ -646,16 +645,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const folder = await notesService.setNotesFolder(path);
       await activateFolder(folder);
     } catch (error) {
-      setError(error instanceof Error ? error.message : "Failed to set notes folder");
-    }
-  }, [activateFolder]);
-
-  // Another window or the CLI has already configured the folder in the backend.
-  const syncNotesFolder = useCallback(async (path: string) => {
-    try {
-      await activateFolder(path);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Failed to sync notes folder");
+      setError(String(error));
+      throw error;
     }
   }, [activateFolder]);
 
@@ -746,7 +737,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, [expandFolder]);
 
   useEffect(() => {
-    const unlisten = listen<string>("folder-change", event => {
+    const unlisten = getCurrentWindow().listen<string>("folder-change", event => {
       if (browseRef.current?.treeMode) scheduleRefresh([event.payload]);
     });
     return () => { void unlisten.then(dispose => dispose()); };
@@ -758,7 +749,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     let isCancelled = false;
     let unlisten: (() => void) | undefined;
 
-    listen<{ changed_ids: string[] }>("file-change", (event) => {
+    getCurrentWindow().listen<{ changed_ids: string[] }>("file-change", (event) => {
       // Don't process if effect was cleaned up
       if (isCancelled) return;
 
@@ -793,7 +784,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   // Listen for "select-note" events from the backend (CLI, drag-drop, Open With, import from preview)
   useEffect(() => {
-    const unlisten = listen<string>("select-note", (event) => {
+    const unlisten = getCurrentWindow().listen<string>("select-note", (event) => {
       // Refresh the notes list so the sidebar shows the new note immediately
       refreshNotes();
       selectNote(event.payload);
@@ -856,7 +847,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       collapseAllFolders,
       reloadCurrentNote,
       setNotesFolder,
-      syncNotesFolder,
       search,
       clearSearch,
       pinNote,
@@ -883,7 +873,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       collapseAllFolders,
       reloadCurrentNote,
       setNotesFolder,
-      syncNotesFolder,
       search,
       clearSearch,
       pinNote,
