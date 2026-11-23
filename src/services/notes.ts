@@ -5,7 +5,7 @@ export async function getNotesFolder(): Promise<string | null> {
   return invoke("get_notes_folder");
 }
 
-export async function setNotesFolder(path: string): Promise<void> {
+export async function setNotesFolder(path: string): Promise<string> {
   return invoke("set_notes_folder", { path });
 }
 

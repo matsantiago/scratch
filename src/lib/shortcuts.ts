@@ -1,4 +1,4 @@
-import { alt, mod, shift } from "./platform";
+import { alt, isMac, mod, shift } from "./platform";
 
 export interface Shortcut {
   keys: string[];
@@ -19,6 +19,7 @@ export const shortcutCategories: ShortcutCategory[] = [
       { keys: [mod, "\\"], description: "Toggle sidebar" },
       { keys: [mod, ","], description: "Settings" },
       { keys: [mod, "/"], description: "Keyboard shortcuts" },
+      ...(isMac ? [{ keys: [mod, shift, "N"], description: "New window" }] : []),
       { keys: [mod, "W"], description: "Close window" },
       { keys: [mod, "="], description: "Zoom in" },
       { keys: [mod, "-"], description: "Zoom out" },

@@ -79,7 +79,7 @@ function AppContent() {
   const [aiProvider, setAiProvider] = useState<AiProvider>("claude");
   const editorRef = useRef<TiptapEditor | null>(null);
 
-  // Listen for set-notes-folder event from CLI (scratch .)
+  // Keep this window in sync when the CLI or another window changes the notes folder.
   // Placed here in AppContent where both NotesContext and ThemeContext are available
   useEffect(() => {
     let cancelled = false;
@@ -321,7 +321,7 @@ function AppContent() {
       }
 
       // Cmd+N - New note
-      if ((e.metaKey || e.ctrlKey) && e.key === "n") {
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === "n") {
         e.preventDefault();
         createNote();
         return;
@@ -655,9 +655,9 @@ function App() {
     document.documentElement.classList.add(`platform-${os}`);
   }, []);
 
-  // Check for app updates on startup (folder mode only)
+  // Check for app updates only on startup.
   useEffect(() => {
-    if (isPreview) return;
+    if (isPreview || getCurrentWindow().label !== "main") return;
     const timer = setTimeout(() => showUpdateToast(), 3000);
     return () => clearTimeout(timer);
   }, [isPreview]);

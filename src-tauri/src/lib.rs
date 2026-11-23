@@ -11,7 +11,7 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow};
 use tauri::webview::WebviewWindowBuilder;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tokio::fs;
@@ -161,6 +161,7 @@ pub struct AiExecutionResult {
 
 // File watcher state
 pub struct FileWatcherState {
+    folder: String,
     #[allow(dead_code)]
     watcher: RecommendedWatcher,
 }
@@ -901,10 +902,16 @@ fn get_notes_folder(state: State<AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-fn set_notes_folder(app: AppHandle, path: String, state: State<AppState>) -> Result<(), String> {
+fn set_notes_folder(window: WebviewWindow, path: String, state: State<AppState>) -> Result<String, String> {
     let path_buf = normalize_notes_folder_path(&path)?;
-    initialize_notes_folder(&app, &path_buf, &state)?;
-    Ok(())
+    let app = window.app_handle();
+    let folder = initialize_notes_folder(app, &path_buf, &state)?;
+    for label in app.webview_windows().keys() {
+        if is_workspace_window(label) && label != window.label() {
+            let _ = app.emit_to(label.as_str(), "set-notes-folder", &folder);
+        }
+    }
+    Ok(folder)
 }
 
 #[tauri::command]
@@ -1264,35 +1271,34 @@ async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) 
     let mut final_id = base_id.clone();
     let mut counter = if has_counter { 2 } else { 1 };
 
-    // Ensure filename uniqueness
-    while abs_path_from_id(&folder_path, &final_id)
-        .map(|p| p.exists())
-        .unwrap_or(false)
-    {
-        if has_counter {
-            final_id = sanitized.replace("{counter}", &counter.to_string());
-        } else {
-            final_id = format!("{}-{}", base_id, counter);
+    let (display_title, content, file_path) = loop {
+        let file_path = abs_path_from_id(&folder_path, &final_id)?;
+        // Templates may include parent directories.
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
         }
-        counter += 1;
-    }
-
-    // Extract display title from filename
-    let display_title = extract_title_from_id(&final_id);
-
-    let content = format!("# {}\n\n", display_title);
-    let file_path = abs_path_from_id(&folder_path, &final_id)?;
-
-    // Create parent directories (for templates like {year}/{month}/{day})
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    fs::write(&file_path, &content)
-        .await
-        .map_err(|e| e.to_string())?;
+        match fs::OpenOptions::new().write(true).create_new(true).open(&file_path).await {
+            Ok(mut file) => {
+                let title = extract_title_from_id(&final_id);
+                let content = format!("# {title}\n\n");
+                if let Err(error) = file.write_all(content.as_bytes()).await {
+                    drop(file);
+                    let _ = fs::remove_file(&file_path).await;
+                    return Err(error.to_string());
+                }
+                break (title, content, file_path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                final_id = if has_counter {
+                    sanitized.replace("{counter}", &counter.to_string())
+                } else {
+                    format!("{base_id}-{counter}")
+                };
+                counter += 1;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
 
     let modified = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2096,10 +2102,8 @@ async fn import_file_to_folder(
         cache.insert(metadata.id.clone(), metadata.clone());
     }
 
-    // Tell the main window to select the imported note and focus it
-    let _ = app.emit_to("main", "select-note", &metadata.id);
-    if let Some(main_window) = app.get_webview_window("main") {
-        let _ = main_window.set_focus();
+    if let Err(error) = open_workspace_note(&app, &metadata.id, None) {
+        eprintln!("Could not show imported note: {error}");
     }
 
     Ok(metadata)
@@ -2429,7 +2433,7 @@ fn setup_file_watcher(
         .watch(&folder_path, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
 
-    Ok(FileWatcherState { watcher })
+    Ok(FileWatcherState { folder: notes_folder.to_owned(), watcher })
 }
 
 #[tauri::command]
@@ -2441,6 +2445,11 @@ async fn start_file_watcher(app: AppHandle, state: State<'_, AppState>) -> Resul
             .clone()
             .ok_or("Notes folder not set")?
     };
+
+    let watching_folder = |watcher: &FileWatcherState| watcher.folder == folder;
+    if state.file_watcher.lock().expect("file watcher mutex").as_ref().is_some_and(watching_folder) {
+        return Ok(());
+    }
 
     // Clean up debounce map before starting
     cleanup_debounce_map(&state.debounce_map);
@@ -2457,6 +2466,9 @@ async fn start_file_watcher(app: AppHandle, state: State<'_, AppState>) -> Resul
             return Ok(());
         }
         let mut file_watcher = state.file_watcher.lock().expect("file watcher mutex");
+        if file_watcher.as_ref().is_some_and(watching_folder) {
+            return Ok(());
+        }
         file_watcher.replace(watcher)
     };
     drop(previous);
@@ -3674,10 +3686,101 @@ async fn ai_execute_ollama(
     }
 }
 
-/// Check if a markdown file is inside the configured notes folder.
-/// If so, emit a "select-note" event to the main window and focus it, returning true.
-/// Returns false on any failure so callers can fall back to create_preview_window.
-fn try_select_in_notes_folder(app: &AppHandle, path: &Path) -> bool {
+const NEW_WINDOW_ARG: &str = "--new-window";
+const WORKSPACE_WINDOW_PREFIX: &str = "workspace-";
+static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
+
+fn is_workspace_window(label: &str) -> bool {
+    label == "main" || label.starts_with(WORKSPACE_WINDOW_PREFIX)
+}
+
+fn workspace_window(app: &AppHandle, preferred: Option<&str>) -> Option<WebviewWindow> {
+    if let Some(window) = preferred
+        .filter(|label| is_workspace_window(label))
+        .and_then(|label| app.get_webview_window(label))
+    {
+        return Some(window);
+    }
+
+    app.webview_windows()
+        .into_values()
+        .filter(|window| is_workspace_window(window.label()))
+        .max_by_key(|window| (
+            window.is_focused().unwrap_or(false),
+            window.is_visible().unwrap_or(false),
+            window.label() == "main",
+        ))
+}
+
+fn create_workspace_window(app: &AppHandle, note: Option<&str>) -> tauri::Result<WebviewWindow> {
+    let mut config = app.config().app.windows.iter()
+        .find(|window| window.label == "main")
+        .expect("main window configuration")
+        .clone();
+    let id = NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
+    config.label = format!("{WORKSPACE_WINDOW_PREFIX}{id}");
+    config.visible = true;
+    config.focus = true;
+    if let Some(note) = note {
+        let encoded = urlencoding::encode(note);
+        config.url = WebviewUrl::App(format!("index.html?note={encoded}").into());
+    }
+    WebviewWindowBuilder::from_config(app, &config)?.build()
+}
+
+fn focus_workspace_window(window: &WebviewWindow) -> tauri::Result<()> {
+    window.show()?;
+    window.unminimize()?;
+    window.set_focus()
+}
+
+fn show_workspace(app: &AppHandle) -> tauri::Result<()> {
+    let window = match workspace_window(app, None) {
+        Some(window) => window,
+        None => create_workspace_window(app, None)?,
+    };
+    focus_workspace_window(&window)
+}
+
+fn new_workspace_window(app: &AppHandle) {
+    let result = create_workspace_window(app, None).and_then(|window| focus_workspace_window(&window));
+    if let Err(error) = result {
+        eprintln!("Could not open a new Scratch window: {error}");
+    }
+}
+
+fn open_workspace_note(app: &AppHandle, id: &str, preferred: Option<&str>) -> tauri::Result<()> {
+    let window = match workspace_window(app, preferred) {
+        Some(window) => {
+            app.emit_to(window.label(), "select-note", id)?;
+            window
+        }
+        None => create_workspace_window(app, Some(id))?,
+    };
+    focus_workspace_window(&window)
+}
+
+#[cfg(target_os = "macos")]
+fn app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind};
+
+    let menu = Menu::default(app)?;
+    for item in menu.items()? {
+        if let MenuItemKind::Submenu(submenu) = item {
+            if submenu.text()? == "File" {
+                let new_window = MenuItem::with_id(
+                    app, "new-window", "New Window", true, Some("Command+Shift+N"),
+                )?;
+                submenu.insert(&new_window, 0)?;
+                break;
+            }
+        }
+    }
+    Ok(menu)
+}
+
+/// Opens a note in the workspace if it is inside the configured notes folder.
+fn try_select_in_notes_folder(app: &AppHandle, path: &Path, preferred: Option<&str>) -> bool {
     let state = match app.try_state::<AppState>() {
         Some(s) => s,
         None => return false,
@@ -3716,12 +3819,7 @@ fn try_select_in_notes_folder(app: &AppHandle, path: &Path) -> bool {
         None => return false,
     };
 
-    let _ = app.emit_to("main", "select-note", note_id);
-    if let Some(main_window) = app.get_webview_window("main") {
-        let _ = main_window.show();
-        let _ = main_window.set_focus();
-    }
-    true
+    open_workspace_note(app, &note_id, preferred).is_ok()
 }
 
 /// Check if a file extension is a supported markdown extension.
@@ -3831,7 +3929,7 @@ fn open_file_preview(app: AppHandle, path: String) -> Result<(), String> {
         return Err(format!("File not found: {}", path));
     }
 
-    if !try_select_in_notes_folder(&app, &file_path) {
+    if !try_select_in_notes_folder(&app, &file_path, None) {
         create_preview_window(&app, &path)?;
     }
     Ok(())
@@ -3857,7 +3955,7 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
 
         if is_markdown_extension(&path) && path.is_file() {
             opened_file = true;
-            if !try_select_in_notes_folder(app, &path)
+            if !try_select_in_notes_folder(app, &path, None)
                 && create_preview_window(app, &path.to_string_lossy()).is_ok()
             {
                 opened_preview = true;
@@ -3877,19 +3975,13 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
                     eprintln!("Failed to initialize notes folder {:?}: {}", canonical, e);
                 }
             }
-            if let Some(main_window) = app.get_webview_window("main") {
-                let _ = main_window.show();
-                let _ = main_window.set_focus();
-            }
+            let _ = show_workspace(app);
         }
     }
 
-    // If no files were opened, show and focus the main window
+    // A plain launch focuses an existing workspace.
     if !opened_file {
-        if let Some(main_window) = app.get_webview_window("main") {
-            let _ = main_window.show();
-            let _ = main_window.set_focus();
-        }
+        let _ = show_workspace(app);
     }
 
     opened_preview
@@ -3931,10 +4023,23 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     enable_webview_spellcheck_defaults();
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(app_menu).on_menu_event(|app, event| {
+        if event.id() == "new-window" {
+            new_workspace_window(app);
+        }
+    });
+
+    let app = builder
         // Single-instance: forward CLI args from subsequent launches to the running instance
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            handle_cli_args(app, &args, &cwd);
+            if args.iter().skip(1).any(|arg| arg == NEW_WINDOW_ARG) {
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || new_workspace_window(&app));
+            } else {
+                handle_cli_args(app, &args, &cwd);
+            }
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
@@ -3992,7 +4097,8 @@ pub fn run() {
             // see the preview. When no notes folder is configured yet, the main window is
             // always shown so new users can complete onboarding via the FolderPicker.
             let args: Vec<String> = std::env::args().collect();
-            let opened_preview = if args.len() > 1 {
+            // On a cold --new-window launch the initial workspace is already the new window.
+            let opened_preview = if args.len() > 1 && !args.iter().skip(1).any(|arg| arg == NEW_WINDOW_ARG) {
                 let cwd = std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy()
@@ -4033,7 +4139,7 @@ pub fn run() {
                 for path in paths {
                     if is_markdown_extension(path)
                         && path.is_file()
-                        && !try_select_in_notes_folder(app, path)
+                        && !try_select_in_notes_folder(app, path, Some(window.label()))
                     {
                         let _ = create_preview_window(app, &path.to_string_lossy());
                     }
@@ -4101,21 +4207,25 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // Use .run() callback to handle macOS "Open With" file events
-    // RunEvent::Opened is macOS-only in Tauri v2
     app.run(|_app_handle, _event| {
         #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Opened { urls } = _event {
-            for url in urls {
-                if let Ok(path) = url.to_file_path() {
-                    if is_markdown_extension(&path)
-                        && path.is_file()
-                        && !try_select_in_notes_folder(_app_handle, &path)
-                    {
-                        let _ = create_preview_window(_app_handle, &path.to_string_lossy());
+        match _event {
+            tauri::RunEvent::Opened { urls } => {
+                for url in urls {
+                    if let Ok(path) = url.to_file_path() {
+                        if is_markdown_extension(&path)
+                            && path.is_file()
+                            && !try_select_in_notes_folder(_app_handle, &path, None)
+                        {
+                            let _ = create_preview_window(_app_handle, &path.to_string_lossy());
+                        }
                     }
                 }
             }
+            tauri::RunEvent::Reopen { has_visible_windows: false, .. } => {
+                let _ = show_workspace(_app_handle);
+            }
+            _ => {}
         }
     });
 }
@@ -4187,7 +4297,7 @@ fn set_title_bar_theme(
     #[cfg(target_os = "windows")]
     {
         for (label, window) in app.webview_windows() {
-            if label == "main" || label.starts_with("preview-") {
+            if is_workspace_window(&label) || label.starts_with("preview-") {
                 windows_title_bar::apply_title_bar_theme(&window, is_dark, (r, g, b));
             }
         }

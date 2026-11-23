@@ -643,14 +643,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   const setNotesFolder = useCallback(async (path: string) => {
     try {
-      await notesService.setNotesFolder(path);
-      await activateFolder(path);
+      const folder = await notesService.setNotesFolder(path);
+      await activateFolder(folder);
     } catch (error) {
       setError(error instanceof Error ? error.message : "Failed to set notes folder");
     }
   }, [activateFolder]);
 
-  // The CLI has already configured the new folder in the backend.
+  // Another window or the CLI has already configured the folder in the backend.
   const syncNotesFolder = useCallback(async (path: string) => {
     try {
       await activateFolder(path);
@@ -725,12 +725,19 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    const initialNoteId = new URLSearchParams(window.location.search).get("note");
     notesService.getNotesFolder()
-      .then(folder => folder && !cancelled ? activateFolder(folder) : undefined)
+      .then(async (folder) => {
+        if (!folder || cancelled) return;
+        await activateFolder(folder);
+        if (initialNoteId && !cancelled && browseRef.current?.root === folder) {
+          await selectNote(initialNoteId);
+        }
+      })
       .catch(error => { if (!cancelled) setError(String(error)); })
       .finally(() => { if (!cancelled) setIsLoading(false); });
     return () => { cancelled = true; };
-  }, [activateFolder]);
+  }, [activateFolder, selectNote]);
 
   useEffect(() => {
     const onExpand = (event: Event) => expandFolder((event as CustomEvent<string>).detail);

@@ -108,6 +108,12 @@ Scratch is designed to be usable without a mouse. Here are the essentials to get
 
 Many more shortcuts and features are available in the app—explore via the command palette (`Cmd+P` / `Ctrl+P`) or view the full reference in Settings → Shortcuts.
 
+On macOS, choose **File → New Window** or press `Cmd+Shift+N` to open another Scratch window. For a global keyboard shortcut, add a **Run Shell Script** action in Shortcuts with this command and assign a keyboard shortcut in the shortcut's details.
+
+```sh
+/usr/bin/open -n -a /Applications/Scratch.app --args --new-window
+```
+
 ## Built With
 
 [Tauri](https://tauri.app/) · [React](https://react.dev/) · [TipTap](https://tiptap.dev/) · [Tailwind CSS](https://tailwindcss.com/) · [Tantivy](https://github.com/quickwit-oss/tantivy)

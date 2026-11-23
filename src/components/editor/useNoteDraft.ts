@@ -7,6 +7,7 @@ type Session = {
   note: Note;
   pending: (() => string) | null;
   conflict: { disk: string | null } | null;
+  persistedConflict: string | null;
   saving: Promise<void> | null;
   writing: string | null;
   timer: number | null;
@@ -21,12 +22,18 @@ function persistConflict(session: Session) {
   try {
     const key = draftKey(session.note.path);
     if (session.conflict && session.pending) {
-      localStorage.setItem(key, JSON.stringify({
+      const stored = JSON.stringify({
         base: session.note.content,
         local: session.pending(),
-      }));
-    } else {
-      localStorage.removeItem(key);
+      });
+      localStorage.setItem(key, stored);
+      session.persistedConflict = stored;
+    } else if (session.persistedConflict !== null) {
+      // Another window may have saved a different draft for this note.
+      if (localStorage.getItem(key) === session.persistedConflict) {
+        localStorage.removeItem(key);
+      }
+      session.persistedConflict = null;
     }
   } catch {
     // The editor and in-memory draft still work when local storage is unavailable.
@@ -37,7 +44,7 @@ function openSession(note: Note): Session {
   const existing = drafts.get(note.path);
   if (existing) return existing;
   const session: Session = {
-    note, pending: null, conflict: null, saving: null, writing: null,
+    note, pending: null, conflict: null, persistedConflict: null, saving: null, writing: null,
     timer: null, checking: false, checkAgain: false,
   };
   try {
@@ -48,6 +55,7 @@ function openSession(note: Note): Session {
         session.note = { ...note, content: base };
         session.pending = () => local;
         session.conflict = { disk: note.content };
+        session.persistedConflict = stored;
         drafts.set(note.path, session);
       }
     }
